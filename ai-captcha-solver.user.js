@@ -1,23 +1,29 @@
 // ==UserScript==
-// @name         AI Captcha Solver - Free Universal Solver
+// @name         AI Captcha Solver - Free Universal Solver v3
 // @namespace    Terminator.Scripts
-// @version      1.0.0
-// @description  Free AI captcha solver using Tesseract.js (OCR) + Hugging Face (vision). No API key needed.
+// @version      3.1.0
+// @description  AI captcha solver running inside captcha iframes. Tesseract.js OCR + Hugging Face CLIP AI. Zero API key, zero limits.
 // @author       TERMINATOR
 // @match        *://*/*
+// @match        https://www.google.com/recaptcha/api2/*
+// @match        https://www.recaptcha.net/recaptcha/api2/*
+// @match        https://newassets.hcaptcha.com/captcha/v1/*
+// @match        https://assets.hcaptcha.com/captcha/v1/*
+// @match        https://challenges.cloudflare.com/cdn-cgi/challenge-platform/*
+// @match        https://challenges.cloudflare.com/turnstile/*
+// @match        https://*.funcaptcha.com/*
+// @match        https://*.arkoselabs.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
-// @grant        GM_addElement
-// @grant        GM_getResourceText
 // @grant        GM_notification
 // @grant        unsafeWindow
 // @connect      huggingface.co
 // @connect      api-inference.huggingface.co
 // @connect      cdn.jsdelivr.net
+// @connect      tesseract.projectnaptha.com
 // @run-at       document-start
-// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
 // @downloadURL  https://github.com/terminator1626/captcha-solver/blob/main/ai-captcha-solver.user.js
 // @updateURL    https://github.com/terminator1626/captcha-solver/blob/main/ai-captcha-solver.user.js
 // ==/UserScript==
@@ -29,1140 +35,648 @@
     enabled: true,
     autoSolve: true,
     autoSubmit: false,
-    solveDelay: { min: 800, max: 2500 },
-    humanizeMouse: true,
     humanizeDelay: true,
     notifications: true,
-    recaptcha: { enabled: true, autoSolve: true, retryOnFail: true, maxRetries: 5 },
-    hcaptcha: { enabled: true, autoSolve: true, retryOnFail: true, maxRetries: 5 },
-    turnstile: { enabled: true, autoSolve: true, retryOnFail: true, maxRetries: 3 },
-    funcaptcha: { enabled: true, autoSolve: true, retryOnFail: true, maxRetries: 3 },
-    cloudflareChallenge: { enabled: true, autoSolve: true },
-    geetest: { enabled: true, autoSolve: true },
-    textCaptcha: { enabled: true, autoSolve: true },
+    recaptcha: { enabled: true, maxRetries: 5 },
+    hcaptcha: { enabled: true, maxRetries: 5 },
+    turnstile: { enabled: true, maxRetries: 3 },
+    funcaptcha: { enabled: true, maxRetries: 3 },
+    geetest: { enabled: true },
+    textCaptcha: { enabled: true },
     ai: {
       useHuggingFace: true,
-      hfModel: 'google/vit-base-patch16-224',
-      hfZeroShot: true,
       ocrLanguage: 'eng',
-      confidenceThreshold: 0.6,
+      confidenceThreshold: 0.35,
+      hfRetries: 3,
+      hfTimeout: 45000,
+      hfWaitOnLoading: 20,
     },
-    bypassIframeDetection: true,
-    hookCaptchaAPIs: true,
     logLevel: 'info',
   };
 
-  const Logger = {
-    prefix: '[CaptchaSolver]',
-    colors: { debug: '#888', info: '#4CAF50', warn: '#FF9800', error: '#F44336', ai: '#00BCD4' },
-    _log(level, ...args) {
-      const config = getConfig();
-      const levels = ['debug', 'info', 'warn', 'error'];
-      if (levels.indexOf(level) < levels.indexOf(config.logLevel)) return;
-      const style = `color: ${this.colors[level] || '#fff'}; font-weight: bold;`;
-      console.log(`%c${this.prefix}`, style, ...args);
-    },
-    debug(...args) { this._log('debug', ...args); },
-    info(...args) { this._log('info', ...args); },
-    warn(...args) { this._log('warn', ...args); },
-    error(...args) { this._log('error', ...args); },
-    ai(...args) { this._log('ai', ...args); },
-  };
+  const LOG_COLORS = { debug: '#888', info: '#4CAF50', warn: '#FF9800', error: '#F44336', ai: '#00E5FF', captcha: '#E040FB' };
 
   function getConfig() {
+    try { const s = GM_getValue('cs_config'); return s ? deepMerge(DEFAULT_CONFIG, s) : JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
+    catch { return JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
+  }
+
+  function deepMerge(base, ov) {
+    const out = { ...base };
+    for (const k of Object.keys(ov)) {
+      if (ov[k] && typeof ov[k] === 'object' && !Array.isArray(ov[k])) out[k] = deepMerge(base[k] || {}, ov[k]);
+      else out[k] = ov[k];
+    }
+    return out;
+  }
+
+  function setConfig(key, val) {
+    const c = getConfig(); const p = key.split('.'); let o = c;
+    for (let i = 0; i < p.length - 1; i++) o = o[p[i]];
+    o[p[p.length - 1]] = val; GM_setValue('cs_config', c);
+  }
+
+  const L = {
+    _log(lvl, ...a) {
+      const cfg = getConfig(); const lvls = ['debug', 'info', 'warn', 'error'];
+      if (lvls.indexOf(lvl) < lvls.indexOf(cfg.logLevel)) return;
+      console.log(`%c[CS]`, `color:${LOG_COLORS[lvl]};font-weight:bold;background:#000;padding:2px 6px;border-radius:3px;`, ...a);
+    },
+    d(...a) { this._log('debug', ...a); }, i(...a) { this._log('info', ...a); },
+    w(...a) { this._log('warn', ...a); }, e(...a) { this._log('error', ...a); },
+    a(...a) { this._log('ai', ...a); }, c(...a) { this._log('captcha', ...a); },
+  };
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const hDelay = async (min = 300, max = 900) => {
+    const d = getConfig().humanizeDelay ? min + Math.random() * (max - min) : min;
+    await sleep(d);
+  };
+
+  async function click(el) {
+    if (!el || el.disabled || el.offsetParent === null) return false;
+    await hDelay(50, 150);
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, view: window }));
+    await sleep(40);
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, view: window }));
+    await sleep(40);
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, view: window }));
+    return true;
+  }
+
+  function isInIframe() {
+    try { return window.location !== window.parent.location; } catch { return true; }
+  }
+
+  function getIframeType() {
     try {
-      const saved = GM_getValue('captchaSolverConfig', null);
-      return saved ? mergeConfig(DEFAULT_CONFIG, saved) : { ...DEFAULT_CONFIG };
-    } catch {
-      return { ...DEFAULT_CONFIG };
-    }
+      const h = window.location.href;
+      if (/recaptcha\.net|google\.com\/recaptcha/i.test(h)) return 'recaptcha';
+      if (/hcaptcha\.com/i.test(h)) return 'hcaptcha';
+      if (/challenges\.cloudflare\.com/i.test(h)) return 'turnstile';
+      if (/funcaptcha\.com|arkoselabs\.com|arkose\.com/i.test(h)) return 'funcaptcha';
+    } catch {}
+    return null;
   }
 
-  function mergeConfig(defaults, overrides) {
-    const result = { ...defaults };
-    for (const key of Object.keys(overrides)) {
-      if (typeof overrides[key] === 'object' && overrides[key] !== null && !Array.isArray(overrides[key])) {
-        result[key] = mergeConfig(defaults[key] || {}, overrides[key]);
-      } else {
-        result[key] = overrides[key];
-      }
-    }
-    return result;
+  function getPageType() {
+    if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"]')) return 'recaptcha';
+    if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"]')) return 'hcaptcha';
+    if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')) return 'turnstile';
+    if (document.querySelector('.geetest, iframe[src*="geetest"]')) return 'geetest';
+    if (document.querySelector('input[name*="captcha" i], input[id*="captcha" i]')) return 'textCaptcha';
+    return null;
   }
 
-  function setConfig(key, value) {
-    const config = getConfig();
-    if (key.includes('.')) {
-      const parts = key.split('.');
-      let obj = config;
-      for (let i = 0; i < parts.length - 1; i++) {
-        obj = obj[parts[i]];
-      }
-      obj[parts[parts.length - 1]] = value;
-    } else {
-      config[key] = value;
-    }
-    GM_setValue('captchaSolverConfig', config);
+  // ===== TESSERACT.JS LOADER =====
+  let TesseractLoaded = false;
+  async function loadTesseract() {
+    if (TesseractLoaded || (typeof Tesseract !== 'undefined')) { TesseractLoaded = true; return; }
+    return new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      s.onload = () => { TesseractLoaded = true; resolve(); };
+      s.onerror = () => { L.w('Failed to load Tesseract.js'); resolve(); };
+      (document.head || document.documentElement).appendChild(s);
+    });
   }
 
-  const Utils = {
-    sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+  async function runOCR(img) {
+    await loadTesseract();
+    if (typeof Tesseract === 'undefined') { L.w('Tesseract not available'); return ''; }
+    try {
+      L.a('Running OCR...');
+      const { data: { text } } = await Tesseract.recognize(img, getConfig().ai.ocrLanguage);
+      L.a('OCR result:', text.trim());
+      return text.trim();
+    } catch (e) { L.e('OCR failed:', e); return ''; }
+  }
 
-    async humanDelay(min = 500, max = 2000) {
-      if (!getConfig().humanizeDelay) { await this.sleep(min); return; }
-      await this.sleep(min + Math.random() * (max - min));
-    },
-
-    randomPoint(el) {
-      const r = el.getBoundingClientRect();
-      return { x: r.left + r.width * (0.2 + Math.random() * 0.6), y: r.top + r.height * (0.2 + Math.random() * 0.6) };
-    },
-
-    async moveMouse(el) {
-      if (!getConfig().humanizeMouse) return;
-      const pt = this.randomPoint(el);
-      for (let i = 0; i < 8; i++) {
-        el.dispatchEvent(new MouseEvent('mousemove', {
-          clientX: pt.x + (Math.random() - 0.5) * 30,
-          clientY: pt.y + (Math.random() - 0.5) * 30,
-          bubbles: true, view: window,
-        }));
-        await this.sleep(15 + Math.random() * 25);
-      }
-    },
-
-    async clickElement(el) {
-      if (!el || el.disabled) { Logger.warn('Element not found or disabled'); return false; }
-      await this.moveMouse(el);
-      await this.humanDelay(80, 200);
-      const pt = this.randomPoint(el);
-      for (const type of ['mousedown', 'mouseup', 'click']) {
-        el.dispatchEvent(new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window, clientX: pt.x, clientY: pt.y,
-        }));
-        await this.sleep(30 + Math.random() * 40);
-      }
-      return true;
-    },
-
-    async clickIframe(iframe, selector) {
-      try {
-        const doc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (!doc) return false;
-        const el = doc.querySelector(selector);
-        if (!el) return false;
-        el.click();
-        return true;
-      } catch { return false; }
-    },
-
-    getIframeDoc(iframe) {
-      try { return iframe.contentDocument || iframe.contentWindow?.document; } catch { return null; }
-    },
-
-    async runOCR(imageElement) {
-      try {
-        Logger.ai('Running OCR with Tesseract.js...');
-        const config = getConfig();
-        const { data: { text } } = await Tesseract.recognize(imageElement, config.ai.ocrLanguage, {
-          logger: m => Logger.debug('OCR progress:', m),
-        });
-        Logger.ai('OCR result:', text.trim());
-        return text.trim();
-      } catch (e) {
-        Logger.error('OCR failed:', e);
-        return '';
-      }
-    },
-
-    async classifyImage(imageSrc, labels) {
-      const config = getConfig();
-      if (!config.ai.useHuggingFace) return {};
-
-      try {
-        Logger.ai('Classifying image with HF:', labels.join(', '));
-
-        const imageBlob = await this.imageSrcToBlob(imageSrc);
-        if (!imageBlob) return {};
-
-        if (config.ai.hfZeroShot && labels.length > 0) {
-          return await this.hfZeroShotImageClassification(imageBlob, labels);
-        }
-
-        return await this.hfImageClassification(imageBlob);
-      } catch (e) {
-        Logger.error('HF classification failed:', e);
-        return {};
-      }
-    },
-
-    async hfZeroShotImageClassification(imageBlob, candidateLabels) {
-      try {
-        const response = await this.hfRequest({
-          url: `https://api-inference.huggingface.co/models/openai/clip-vit-large-patch14`,
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            inputs: { image: await this.blobToBase64(imageBlob) },
-            parameters: { candidate_labels: candidateLabels },
-          }),
-          timeout: 30000,
-        });
-
-        if (response.error) {
-          Logger.debug('HF error (trying fallback):', response.error);
-          return await this.hfFallback(imageBlob, candidateLabels);
-        }
-
-        const scores = {};
-        if (Array.isArray(response)) {
-          for (const item of response) {
-            scores[item.label] = item.score;
-          }
-        } else if (response.scores) {
-          for (const s of response.scores) {
-            scores[s.label] = s.score;
-          }
-        }
-        Logger.ai('HF scores:', scores);
-        return scores;
-      } catch (e) {
-        Logger.debug('HF zero-shot failed, trying fallback:', e.message);
-        return await this.hfFallback(imageBlob, candidateLabels);
-      }
-    },
-
-    async hfImageClassification(imageBlob) {
-      const config = getConfig();
-      const response = await this.hfRequest({
-        url: `https://api-inference.huggingface.co/models/${config.ai.hfModel}`,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: imageBlob,
-        timeout: 30000,
+  // ===== HF AI =====
+  async function fetchImage(src) {
+    return new Promise((resolve) => {
+      if (src.startsWith('data:')) { resolve(src); return; }
+      GM_xmlhttpRequest({
+        method: 'GET', url: src, responseType: 'blob', timeout: 10000,
+        onload(r) {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(r.response);
+        },
+        onerror: () => resolve(null), ontimeout: () => resolve(null),
       });
+    });
+  }
 
-      if (response.error) return {};
+  async function hfClassify(b64Image, labels) {
+    const ai = getConfig().ai;
+    if (!ai.useHuggingFace) return {};
 
-      const scores = {};
-      if (Array.isArray(response)) {
-        for (const item of response) {
-          scores[item.label] = item.score;
-        }
-      }
-      return scores;
-    },
+    const reqs = [
+      { url: 'https://api-inference.huggingface.co/models/openai/clip-vit-large-patch14', zeroShot: true },
+      { url: 'https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32', zeroShot: true },
+    ];
 
-    async hfFallback(imageBlob, candidateLabels) {
-      try {
-        Logger.ai('Using HF fallback model...');
-        const response = await this.hfRequest({
-          url: 'https://api-inference.huggingface.co/models/google/vit-base-patch16-224',
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: imageBlob,
-          timeout: 30000,
-        });
-
-        const scores = {};
-        if (Array.isArray(response)) {
-          for (const item of response) {
-            for (const label of candidateLabels) {
-              if (item.label.toLowerCase().includes(label.toLowerCase())) {
-                scores[label] = item.score;
-              }
-            }
-          }
-        }
-        return scores;
-      } catch {
-        return {};
-      }
-    },
-
-    async hfRequest(options) {
-      return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          ...options,
-          responseType: 'json',
-          onload: (res) => {
-            try {
-              resolve(typeof res.response === 'object' ? res.response : JSON.parse(res.responseText));
-            } catch {
-              resolve({ error: 'parse_error' });
-            }
-          },
-          onerror: reject,
-          ontimeout: () => reject(new Error('HF request timeout')),
-        });
-      });
-    },
-
-    async imageSrcToBlob(src) {
-      try {
-        if (src.startsWith('data:')) {
-          const byteString = atob(src.split(',')[1]);
-          const mime = src.split(',')[0].split(':')[1].split(';')[0];
-          const ab = new ArrayBuffer(byteString.length);
-          const ia = new Uint8Array(ab);
-          for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
-          return new Blob([ab], { type: mime });
-        }
-
-        if (src.startsWith('blob:')) {
-          const res = await fetch(src);
-          return await res.blob();
-        }
-
-        return new Promise((resolve, reject) => {
-          GM_xmlhttpRequest({
-            method: 'GET',
-            url: src,
-            responseType: 'blob',
-            onload: (res) => resolve(res.response),
-            onerror: reject,
+    for (const { url, zeroShot } of reqs) {
+      for (let attempt = 0; attempt < ai.hfRetries; attempt++) {
+        try {
+          const body = JSON.stringify({
+            inputs: b64Image,
+            parameters: { candidate_labels: labels },
           });
-        });
-      } catch { return null; }
-    },
 
-    async blobToBase64(blob) {
-      return new Promise(resolve => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.readAsDataURL(blob);
-      });
-    },
+          const result = await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+              method: 'POST', url, headers: { 'Content-Type': 'application/json' },
+              data: body, responseType: 'text', timeout: ai.hfTimeout,
+              onload(r) { try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('parse')); } },
+              onerror: reject, ontimeout: () => reject(new Error('timeout')),
+            });
+          });
 
-    async imageToBase64(img) {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth || img.width || 300;
-      canvas.height = img.naturalHeight || img.height || 300;
-      const ctx = canvas.getContext('2d');
-      try {
-        ctx.drawImage(img, 0, 0);
-        return canvas.toDataURL('image/png');
-      } catch {
-        return img.src || null;
-      }
-    },
-
-    parseChallengeText(text) {
-      const textLower = text.toLowerCase();
-      const categoryMap = {
-        'traffic light': ['traffic lights', 'traffic signal', 'stoplight'],
-        'crosswalk': ['crosswalk', 'pedestrian crossing', 'zebra crossing'],
-        'bicycle': ['bicycles', 'bike', 'bikes', 'bicycle'],
-        'bus': ['buses', 'bus'],
-        'car': ['cars', 'car', 'vehicle', 'vehicles'],
-        'motorcycle': ['motorcycles', 'motorcycle', 'motorbike', 'motorbikes'],
-        'fire hydrant': ['fire hydrant', 'hydrant'],
-        'stairs': ['stairs', 'steps', 'staircase'],
-        'bridge': ['bridges', 'bridge'],
-        'mountain': ['mountains', 'mountain', 'hill'],
-        'parking meter': ['parking meter'],
-        'fireplug': ['fireplug', 'fire hydrant'],
-        'palm tree': ['palm trees', 'palm tree'],
-        'taxi': ['taxis', 'taxi', 'cab', 'cabs'],
-        'tractor': ['tractors', 'tractor'],
-        'bus station': ['bus station'],
-        'sidewalk': ['sidewalk', 'pavement'],
-        'truck': ['trucks', 'truck'],
-        'van': ['vans', 'van'],
-        'train': ['trains', 'train', 'subway', 'metro'],
-        'boat': ['boats', 'boat', 'ship', 'ships'],
-        'airplane': ['airplanes', 'airplane', 'plane', 'planes'],
-        'dog': ['dogs', 'dog'],
-        'cat': ['cats', 'cat'],
-        'horse': ['horses', 'horse'],
-        'bird': ['birds', 'bird'],
-        'bear': ['bears', 'bear'],
-        'elephant': ['elephants', 'elephant'],
-        'zebra': ['zebras', 'zebra'],
-        'giraffe': ['giraffes', 'giraffe'],
-        'stop sign': ['stop sign', 'stop signs'],
-        'bench': ['benches', 'bench'],
-        'mailbox': ['mailboxes', 'mailbox'],
-        'storefront': ['storefronts', 'storefront', 'shop', 'shops'],
-        'chimney': ['chimneys', 'chimney'],
-        'playground': ['playgrounds', 'playground'],
-        'tower': ['towers', 'tower'],
-        'fountain': ['fountains', 'fountain'],
-        'swimming pool': ['swimming pool', 'pool', 'pools'],
-        'garden': ['gardens', 'garden'],
-        'beach': ['beaches', 'beach'],
-        'desert': ['desert'],
-        'snow': ['snow'],
-        'water': ['water'],
-        'cloud': ['clouds', 'cloud'],
-        'building': ['buildings', 'building', 'architecture'],
-        'road': ['roads', 'road', 'street', 'streets'],
-      };
-
-      for (const [key, aliases] of Object.entries(categoryMap)) {
-        if (aliases.some(a => textLower.includes(a))) return key;
-      }
-
-      const match = textLower.match(/(?:select|click|tap|choose)\s+(?:all\s+)?(?:the\s+)?(?:images?\s+)?(?:with|of|containing|that\s+(?:show|have|contain))?\s+(.+?)(?:\.|$|,|;|if)/);
-      if (match) return match[1].trim().toLowerCase();
-
-      return textLower;
-    },
-
-    getCaptchaLabels() {
-      return [
-        'traffic light', 'crosswalk', 'bicycle', 'bus', 'car', 'motorcycle',
-        'fire hydrant', 'stairs', 'bridge', 'mountain', 'parking meter',
-        'palm tree', 'taxi', 'tractor', 'sidewalk', 'truck', 'van', 'train',
-        'boat', 'airplane', 'dog', 'cat', 'stop sign', 'bench', 'mailbox',
-        'storefront', 'chimney', 'playground', 'tower', 'fountain',
-        'swimming pool', 'building', 'road', 'water', 'snow',
-        'animal', 'vehicle', 'tree', 'person', 'road sign', 'motorway',
-      ];
-    },
-
-    isSameOriginIframe(iframe) {
-      try {
-        return !!iframe.contentDocument;
-      } catch { return false; }
-    },
-  };
-
-  const APIHooks = {
-    init() {
-      if (!getConfig().hookCaptchaAPIs) return;
-      const hook = (obj, method, type) => {
-        if (!unsafeWindow[obj]) return;
-        const orig = unsafeWindow[obj][method];
-        if (typeof orig !== 'function') return;
-        unsafeWindow[obj][method] = async function (...args) {
-          Logger.info(`${type} API call intercepted:`, method, args);
-          CaptchaSolver.onCaptchaDetected(type.toLowerCase());
-          return orig.apply(this, args);
-        };
-      };
-      hook('grecaptcha', 'execute', 'recaptcha');
-      hook('grecaptcha', 'render', 'recaptcha');
-      hook('hcaptcha', 'execute', 'hcaptcha');
-      hook('hcaptcha', 'render', 'hcaptcha');
-      hook('turnstile', 'execute', 'turnstile');
-      hook('turnstile', 'render', 'turnstile');
-      Logger.debug('API hooks initialized');
-    },
-  };
-
-  const AICaptchaSolver = {
-    async solveImageChallenge(images, challengeText, gridType) {
-      Logger.ai('AI solving image challenge:', challengeText);
-      const category = Utils.parseChallengeText(challengeText);
-      Logger.ai('Detected category:', category);
-      const clicked = [];
-
-      if (gridType === 'recaptcha') {
-        for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          try {
-            const tile = img.closest('.rc-imageselect-tile') || img.parentElement;
-            const tileNum = parseInt(tile?.getAttribute('data-tile-index') || tile?.getAttribute('data-row') || '0');
-
-            let imgSrc = null;
-            if (img.src) imgSrc = img.src;
-            else {
-              const bg = img.style.backgroundImage || getComputedStyle(img).backgroundImage;
-              const match = bg?.match(/url\(["']?([^"')]+)["']?\)/);
-              if (match) imgSrc = match[1];
-            }
-
-            if (!imgSrc) {
-              Logger.debug('No image source for tile', i);
+          if (result.error) {
+            L.d(`HF ${url.split('/').pop()}: ${result.error}`);
+            if (result.error.includes('loading') && result.estimated_time) {
+              const wait = Math.min(Math.ceil(result.estimated_time) * 1000, ai.hfWaitOnLoading * 1000);
+              L.a(`Model loading, waiting ${(wait / 1000).toFixed(0)}s`);
+              await sleep(wait);
               continue;
             }
-
-            const scores = await Utils.classifyImage(imgSrc, [category, ...Utils.getCaptchaLabels()]);
-            const score = scores[category] || 0;
-            const threshold = getConfig().ai.confidenceThreshold;
-
-            Logger.ai(`Tile ${i}: "${category}" score = ${score.toFixed(3)} (threshold: ${threshold})`);
-
-            if (score >= threshold) {
-              Logger.ai('-> CLICKING tile', i);
-              await Utils.humanDelay(300, 800);
-              await Utils.clickElement(tile || img);
-              clicked.push(i);
+            if (result.error.includes('rate') || result.error.includes('overloaded')) {
+              L.w('HF rate limited, waiting 5s');
+              await sleep(5000);
+              continue;
             }
-          } catch (e) {
-            Logger.error('Error processing tile', i, e);
-          }
-        }
-      } else if (gridType === 'hcaptcha') {
-        for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          try {
-            const taskItem = img.closest('.task-image') || img.closest('[class*="task"]') || img.parentElement;
-            let imgSrc = img.src || img.getAttribute('data-src');
-
-            if (!imgSrc && img.style.backgroundImage) {
-              const match = img.style.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/);
-              if (match) imgSrc = match[1];
-            }
-
-            if (!imgSrc) continue;
-
-            const scores = await Utils.classifyImage(imgSrc, [category, ...Utils.getCaptchaLabels()]);
-            const score = scores[category] || 0;
-            const threshold = getConfig().ai.confidenceThreshold;
-
-            Logger.ai(`HCaptcha tile ${i}: "${category}" score = ${score.toFixed(3)}`);
-
-            if (score >= threshold) {
-              Logger.ai('-> CLICKING hCaptcha tile', i);
-              await Utils.humanDelay(300, 800);
-              await Utils.clickElement(taskItem || img);
-              clicked.push(i);
-            }
-          } catch (e) {
-            Logger.error('Error processing hCaptcha tile', i, e);
-          }
-        }
-      }
-
-      Logger.ai(`AI clicked ${clicked.length} tiles for "${category}"`);
-      return clicked.length > 0;
-    },
-  };
-
-  const Solvers = {
-    async recaptcha() {
-      Logger.info('Solving reCAPTCHA...');
-
-      const checkboxFrame = document.querySelector('iframe[src*="recaptcha/api2/anchor"]');
-      const challengeFrame = document.querySelector('iframe[src*="recaptcha/api2/bframe"]');
-
-      if (!checkboxFrame && !challengeFrame) {
-        Logger.warn('No reCAPTCHA frames found');
-        if (unsafeWindow.grecaptcha) {
-          for (let i = 0; i < 100; i++) {
-            try { unsafeWindow.grecaptcha.execute(i); } catch { }
-          }
-        }
-        return false;
-      }
-
-      const config = getConfig();
-      let retries = 0;
-
-      while (retries < config.recaptcha.maxRetries) {
-        try {
-          if (checkboxFrame && !challengeFrame) {
-            Logger.info('Clicking reCAPTCHA checkbox...');
-            await Utils.humanDelay(1000, 2000);
-            await Utils.clickIframe(checkboxFrame, '.recaptcha-checkbox, .recaptcha-checkbox-holder, .recaptcha-checkbox-checked');
-            await Utils.humanDelay(2000, 4000);
-
-            if (this.isRecaptchaSolved()) return true;
-
-            await Utils.sleep(2000);
+            break;
           }
 
-          const currentChallenge = document.querySelector('iframe[src*="recaptcha/api2/bframe"]');
-          if (currentChallenge) {
-            const solved = await this.solveRecaptchaChallenge(currentChallenge);
-            if (solved) return true;
+          if (Array.isArray(result)) {
+            const s = {}; for (const i of result) s[i.label] = i.score;
+            L.a('HF scores:', s);
+            return s;
           }
+          if (result.scores && result.labels) {
+            const s = {}; for (let i = 0; i < result.labels.length; i++) s[result.labels[i]] = result.scores[i];
+            L.a('HF scores:', s);
+            return s;
+          }
+          if (result.score) { L.a('HF:', result); return { [result.label]: result.score }; }
 
-          retries++;
-          if (!config.recaptcha.retryOnFail) break;
-          await Utils.humanDelay(2000, 4000);
+          L.d('Unexpected HF response:', JSON.stringify(result).slice(0, 150));
+          break;
         } catch (e) {
-          Logger.error('reCAPTCHA error:', e);
-          retries++;
-          await Utils.humanDelay(3000, 5000);
+          L.d(`HF attempt ${attempt + 1} failed:`, e.message);
+          if (attempt < ai.hfRetries - 1) await sleep(1500);
         }
       }
-
-      return this.isRecaptchaSolved();
-    },
-
-    async solveRecaptchaChallenge(frame) {
-      try {
-        const doc = Utils.getIframeDoc(frame);
-        if (!doc) {
-          Logger.warn('Cannot access reCAPTCHA challenge frame (cross-origin)');
-          return await this.solveRecaptchaExternal();
-        }
-
-        const instructions = doc.querySelector('.rc-imageselect-instructions, .rc-imageselect-dynamic-selector, #rc-imageselect-target');
-        if (instructions) {
-          Logger.info('Challenge:', instructions.textContent.trim());
-
-          const images = doc.querySelectorAll('.rc-imageselect-tile img, .rc-imageselect-table img');
-          if (images.length > 0) {
-            Logger.info(`Found ${images.length} tiles, using AI to solve...`);
-            const success = await AICaptchaSolver.solveImageChallenge(Array.from(images), instructions.textContent, 'recaptcha');
-
-            if (success) {
-              await Utils.humanDelay(1500, 3000);
-
-              const verifyBtn = doc.querySelector('#recaptcha-verify-button');
-              if (verifyBtn && !verifyBtn.disabled) {
-                Logger.info('Clicking Verify...');
-                await Utils.humanDelay(500, 1000);
-                verifyBtn.click();
-              }
-
-              await Utils.humanDelay(2000, 4000);
-              return true;
-            }
-          }
-        }
-
-        if (this.isRecaptchaSolved()) return true;
-        return false;
-      } catch (e) {
-        Logger.error('reCAPTCHA challenge error:', e);
-        return false;
-      }
-    },
-
-    async solveRecaptchaExternal() {
-      Logger.info('Trying external reCAPTCHA approach...');
-      try {
-        const frames = document.querySelectorAll('iframe[src*="recaptcha"]');
-        for (const frame of frames) {
-          try {
-            const doc = Utils.getIframeDoc(frame);
-            if (doc) {
-              const checkbox = doc.querySelector('.recaptcha-checkbox');
-              if (checkbox) { checkbox.click(); return true; }
-              const verify = doc.querySelector('#recaptcha-verify-button');
-              if (verify) { verify.click(); return true; }
-            }
-          } catch { }
-        }
-
-        if (unsafeWindow.grecaptcha) {
-          for (let i = 0; i < 100; i++) {
-            try { unsafeWindow.grecaptcha.execute(i); } catch { }
-          }
-        }
-        return false;
-      } catch (e) {
-        Logger.error('External approach failed:', e);
-        return false;
-      }
-    },
-
-    isRecaptchaSolved() {
-      return !!document.querySelector('.recaptcha-checkbox[aria-checked="true"]') ||
-        !!document.querySelector('.g-recaptcha-response')?.value ||
-        !document.querySelector('iframe[src*="recaptcha/api2/bframe"]') ||
-        document.querySelectorAll('iframe[src*="recaptcha/api2/bframe"]').length === 0;
-    },
-
-    async hcaptcha() {
-      Logger.info('Solving hCaptcha...');
-
-      const anchorFrame = document.querySelector('iframe[src*="hcaptcha.com/captcha"][src*="frame=anchor"]');
-      const challengeFrame = document.querySelector('iframe[src*="hcaptcha.com/captcha"][src*="frame=challenge"]');
-
-      if (!anchorFrame && !challengeFrame) {
-        Logger.warn('No hCaptcha frames found');
-        if (unsafeWindow.hcaptcha) {
-          try { unsafeWindow.hcaptcha.execute(); } catch { }
-        }
-        return false;
-      }
-
-      const config = getConfig();
-      let retries = 0;
-
-      while (retries < config.hcaptcha.maxRetries) {
-        try {
-          if (challengeFrame) {
-            const solved = await this.solveHCaptchaChallenge(challengeFrame);
-            if (solved) return true;
-          }
-
-          if (anchorFrame && !challengeFrame) {
-            Logger.info('Triggering hCaptcha via checkbox...');
-            await Utils.humanDelay(1000, 2000);
-            await Utils.clickIframe(anchorFrame, '.check, .checkbox, [class*="check"]');
-
-            if (unsafeWindow.hcaptcha) {
-              try { unsafeWindow.hcaptcha.execute(); } catch { }
-            }
-
-            await Utils.humanDelay(3000, 5000);
-
-            const newChallenge = document.querySelector('iframe[src*="hcaptcha.com/captcha"][src*="frame=challenge"]');
-            if (newChallenge) {
-              const solved = await this.solveHCaptchaChallenge(newChallenge);
-              if (solved) return true;
-            }
-          }
-
-          retries++;
-          if (!config.hcaptcha.retryOnFail) break;
-          await Utils.humanDelay(2000, 4000);
-        } catch (e) {
-          Logger.error('hCaptcha error:', e);
-          retries++;
-          await Utils.humanDelay(3000, 5000);
-        }
-      }
-
-      return this.isHCaptchaSolved();
-    },
-
-    async solveHCaptchaChallenge(frame) {
-      try {
-        const doc = Utils.getIframeDoc(frame);
-        if (!doc) {
-          Logger.warn('Cannot access hCaptcha challenge frame');
-          return false;
-        }
-
-        const instruction = doc.querySelector('.prompt-text, .challenge-text, [class*="prompt"], [class*="instruction"], #prompt');
-        if (instruction) {
-          Logger.info('hCaptcha task:', instruction.textContent.trim());
-
-          const images = doc.querySelectorAll('.task-image img, .task-image [class*="image"], [class*="task"] img');
-          if (images.length > 0) {
-            Logger.info(`Found ${images.length} hCaptcha tiles, using AI...`);
-            const success = await AICaptchaSolver.solveImageChallenge(Array.from(images), instruction.textContent, 'hcaptcha');
-
-            if (success) {
-              await Utils.humanDelay(1500, 3000);
-
-              const verifyBtn = doc.querySelector('.verify-button, .submit-button, [class*="verify"], [class*="submit"]');
-              if (verifyBtn) {
-                Logger.info('Clicking hCaptcha Verify...');
-                await Utils.humanDelay(500, 1000);
-                verifyBtn.click();
-              }
-
-              await Utils.humanDelay(2000, 4000);
-              return true;
-            }
-          }
-        }
-
-        if (this.isHCaptchaSolved()) return true;
-        return false;
-      } catch (e) {
-        Logger.error('hCaptcha challenge error:', e);
-        return false;
-      }
-    },
-
-    isHCaptchaSolved() {
-      return !!document.querySelector('.h-captcha textarea:valid, .h-captcha [name="h-captcha-response"]:valid')?.value ||
-        document.querySelector('iframe[src*="hcaptcha"]') === null;
-    },
-
-    async turnstile() {
-      Logger.info('Solving Cloudflare Turnstile...');
-      try {
-        const widget = document.querySelector('iframe[src*="challenges.cloudflare.com/turnstile"]');
-        if (!widget) {
-          if (unsafeWindow.turnstile) {
-            const containers = document.querySelectorAll('.cf-turnstile, [class*="turnstile"]');
-            containers.forEach(c => {
-              try {
-                const key = c.getAttribute('data-sitekey');
-                if (key) unsafeWindow.turnstile.execute(c, { sitekey: key });
-              } catch { }
-            });
-          }
-          return false;
-        }
-
-        await Utils.humanDelay(1500, 3000);
-
-        try {
-          const doc = Utils.getIframeDoc(widget);
-          if (doc) {
-            const clickTarget = doc.querySelector('#challenge-stage, .turnstile-checkbox, input[type="checkbox"]');
-            if (clickTarget) {
-              Logger.info('Clicking Turnstile checkbox...');
-              clickTarget.click();
-              await Utils.humanDelay(3000, 6000);
-              return this.isTurnstileSolved();
-            }
-          }
-        } catch { }
-
-        if (unsafeWindow.turnstile) {
-          try {
-            for (const el of document.querySelectorAll('[class*="cf-turnstile"], [class*="turnstile"]')) {
-              unsafeWindow.turnstile.execute(el);
-            }
-          } catch { }
-        }
-
-        await Utils.humanDelay(4000, 8000);
-        return this.isTurnstileSolved();
-      } catch (e) {
-        Logger.error('Turnstile error:', e);
-        return false;
-      }
-    },
-
-    isTurnstileSolved() {
-      return document.querySelector('.cf-turnstile > div > div > span[role="status"]:not(:empty)') ||
-        document.querySelector('iframe[src*="challenges.cloudflare.com"]') === null ||
-        document.querySelector('[data-turnstile-success]') !== null ||
-        document.querySelector('.cf-turnstile iframe') === null;
-    },
-
-    async funcaptcha() {
-      Logger.info('Solving FunCaptcha...');
-      try {
-        const gameFrame = document.querySelector('iframe[src*="funcaptcha.com"], iframe[src*="arkoselabs.com"], iframe[src*="arkose.com"]');
-        if (!gameFrame) return false;
-
-        await Utils.humanDelay(2000, 4000);
-
-        try {
-          const doc = Utils.getIframeDoc(gameFrame);
-          if (doc) {
-            const playBtn = doc.querySelector('.play_button, .start-button, button[class*="start"], #start');
-            if (playBtn) { playBtn.click(); Logger.info('Clicked FunCaptcha start'); }
-
-            const slider = doc.querySelector('input[type="range"], .slider');
-            if (slider) {
-              for (let i = 0; i < 3; i++) {
-                slider.value = Math.random() * 360;
-                slider.dispatchEvent(new Event('input', { bubbles: true }));
-                slider.dispatchEvent(new Event('change', { bubbles: true }));
-                await Utils.humanDelay(500, 1000);
-              }
-              const submit = doc.querySelector('.submit_button, .submit-button');
-              if (submit) submit.click();
-            }
-          }
-        } catch { }
-
-        return this.isFunCaptchaSolved();
-      } catch (e) {
-        Logger.error('FunCaptcha error:', e);
-        return false;
-      }
-    },
-
-    isFunCaptchaSolved() {
-      return document.querySelector('iframe[src*="funcaptcha"]') === null;
-    },
-
-    async cloudflareChallenge() {
-      Logger.info('Bypassing Cloudflare Challenge...');
-      const isChallenge = document.title.includes('Just a moment') ||
-        document.title.includes('Attention Required') ||
-        document.querySelector('#challenge-body, #challenge-stage, #cf-challenge') !== null ||
-        document.querySelector('form[action*="cdn-cgi/challenge-platform"]') !== null;
-
-      if (!isChallenge) return false;
-
-      try {
-        await Utils.sleep(8000);
-        const stillOnChallenge = document.title.includes('Just a moment') ||
-          document.querySelector('#challenge-stage') !== null;
-
-        if (stillOnChallenge) {
-          for (const btn of document.querySelectorAll('button, input[type="submit"], a.button')) {
-            if (/continue|verify|proceed/i.test(btn.textContent)) {
-              await Utils.clickElement(btn);
-              Logger.info('Clicked continue');
-              break;
-            }
-          }
-        }
-        return !stillOnChallenge;
-      } catch (e) {
-        Logger.error('Cloudflare error:', e);
-        return false;
-      }
-    },
-
-    async geetest() {
-      Logger.info('Solving GeeTest...');
-      try {
-        const slider = document.querySelector('.geetest_slider_button, .gt_slider_knob, [class*="slider"]');
-        if (slider) {
-          await Utils.humanDelay(1000, 2000);
-          const rect = slider.getBoundingClientRect();
-          const startX = rect.left + rect.width / 2;
-          const startY = rect.top + rect.height / 2;
-
-          slider.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: startX, clientY: startY }));
-          await Utils.sleep(100);
-
-          const targetX = startX + 150 + Math.random() * 100;
-          for (let i = 1; i <= 25; i++) {
-            const p = i / 25;
-            const ease = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-            slider.dispatchEvent(new MouseEvent('mousemove', {
-              bubbles: true, clientX: startX + (targetX - startX) * ease,
-              clientY: startY + (Math.random() - 0.5) * 5,
-            }));
-            await Utils.sleep(25 + Math.random() * 15);
-          }
-
-          slider.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: targetX, clientY: startY }));
-          Logger.info('GeeTest slider completed');
-          return true;
-        }
-
-        const btn = document.querySelector('.geetest_radar_tip, .gt_panel');
-        if (btn) { await Utils.clickElement(btn); return true; }
-        return false;
-      } catch (e) {
-        Logger.error('GeeTest error:', e);
-        return false;
-      }
-    },
-
-    async textCaptcha() {
-      Logger.info('Solving text captcha with OCR...');
-      try {
-        const input = document.querySelector('input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i], input[name*="verification" i], input[name*="security_code" i]');
-        if (!input) return false;
-
-        const img = document.querySelector('img[src*="captcha" i], img[src*="captchaImage" i], img[src*="code" i], img[src*="verify" i], img[id*="captcha" i], img[name*="captcha" i]');
-        if (!img) return false;
-
-        Logger.ai('Found text captcha, running OCR...');
-        const text = await Utils.runOCR(img);
-        if (!text) return false;
-
-        const cleaned = text.replace(/[^a-zA-Z0-9]/g, '').substring(0, 10);
-        Logger.ai('Cleaned OCR text:', cleaned);
-
-        if (cleaned.length > 0) {
-          input.value = cleaned;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          Logger.info('Filled captcha with:', cleaned);
-          return true;
-        }
-        return false;
-      } catch (e) {
-        Logger.error('Text captcha error:', e);
-        return false;
-      }
-    },
-  };
-
-  const CaptchaSolver = {
-    isSolving: false,
-    solvedCount: 0,
-    failedCount: 0,
-    observer: null,
-
-    init() {
-      Logger.info('AI Captcha Solver v2.0 initialized');
-      Logger.info('Tesseract.js OCR: loaded');
-      Logger.info('Hugging Face AI:', getConfig().ai.useHuggingFace ? 'enabled' : 'disabled');
-      APIHooks.init();
-      this.startMonitoring();
-      this.checkForExistingCaptchas();
-    },
-
-    detectCaptcha() {
-      const results = [];
-      if (document.querySelector('.g-recaptcha, iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], iframe[src*="recaptcha/api2"]')) results.push('recaptcha');
-      if (document.querySelector('.h-captcha, iframe[src*="hcaptcha.com"]')) results.push('hcaptcha');
-      if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com/turnstile"]')) results.push('turnstile');
-      if (document.querySelector('iframe[src*="funcaptcha.com"], iframe[src*="arkoselabs.com"], iframe[src*="arkose.com"]')) results.push('funcaptcha');
-      if (document.querySelector('.geetest, iframe[src*="geetest.com"]')) results.push('geetest');
-      if (document.title.includes('Just a moment') || document.title.includes('Attention Required') || document.querySelector('#challenge-stage, #cf-challenge')) results.push('cloudflareChallenge');
-      if (document.querySelector('input[name*="captcha" i], input[id*="captcha" i]') && document.querySelector('img[src*="captcha" i], img[src*="code" i]')) results.push('textCaptcha');
-      return results;
-    },
-
-    async solve(captchaType) {
-      if (this.isSolving || !getConfig().enabled) return false;
-      const config = getConfig()[captchaType];
-      if (!config?.enabled) { Logger.debug(`${captchaType} disabled`); return false; }
-
-      this.isSolving = true;
-      Logger.info(`Solving ${captchaType}...`);
-
-      try {
-        await Utils.humanDelay(getConfig().solveDelay.min, getConfig().solveDelay.max);
-        const result = await Solvers[captchaType]?.();
-
-        if (result) {
-          this.solvedCount++;
-          Logger.info(`${captchaType} solved! (${this.solvedCount} total)`);
-          if (getConfig().notifications) {
-            GM_notification({ text: `${captchaType} solved!`, title: 'AI Captcha Solver', timeout: 3000 });
-          }
-          if (getConfig().autoSubmit) this.autoSubmitForm();
-        } else {
-          this.failedCount++;
-          Logger.warn(`${captchaType} not solved`);
-        }
-        this.updatePanelStats();
-        return result;
-      } catch (e) {
-        this.failedCount++;
-        Logger.error(`${captchaType} error:`, e);
-        return false;
-      } finally {
-        this.isSolving = false;
-      }
-    },
-
-    onCaptchaDetected(type) {
-      if (getConfig().autoSolve) this.solve(type);
-    },
-
-    async checkForExistingCaptchas() {
-      for (const type of this.detectCaptcha()) {
-        if (getConfig().autoSolve) await this.solve(type);
-      }
-    },
-
-    startMonitoring() {
-      this.observer = new MutationObserver((mutations) => {
-        let changed = false;
-        for (const m of mutations) {
-          for (const node of m.addedNodes) {
-            if (node.nodeType !== 1) continue;
-            if (node.tagName === 'IFRAME' && /recaptcha|hcaptcha|turnstile|funcaptcha|arkose|geetest|captcha/i.test(node.src || '')) {
-              changed = true; break;
-            }
-            if (node.querySelector?.('.g-recaptcha, .h-captcha, .cf-turnstile, .geetest, [class*="captcha"]')) {
-              changed = true; break;
-            }
-          }
-          if (changed) break;
-        }
-        if (changed) {
-          Logger.debug('New captcha detected via DOM');
-          Utils.humanDelay(500, 1500).then(() => this.checkForExistingCaptchas());
-        }
+    }
+    L.w('All HF models failed');
+    return {};
+  }
+
+  // ===== CHALLENGE PARSING =====
+  function getChallengeText() {
+    const sels = [
+      '#rc-imageselect-target', '.rc-imageselect-instructions', '.rc-imageselect-dynamic-selector',
+      '#prompt', '.prompt-text', '.challenge-text', '.instruction-text',
+      '[class*="instruction"]', '[class*="prompt"]', '[class*="challenge"]',
+      '#challenge-text', '.task-text', '.task-label', '.header-text',
+    ];
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      if (el && el.textContent.trim().length > 3) return el.textContent.trim();
+    }
+    return '';
+  }
+
+  function parseCategory(text) {
+    if (!text) return '';
+    const t = text.toLowerCase().replace(/[.!?,]/g, ' ');
+    const map = {
+      'traffic light': /traffic\s*light/i, crosswalk: /crosswalk|pedestrian\s*cross/i,
+      bicycle: /bicyc|bike/i, bus: /bus(es)?/i, car: /car|vehicle/i,
+      motorcycle: /motorcyc|motorbike/i, 'fire hydrant': /fire\s*hydrant|fireplug/i,
+      stairs: /stair|step/i, bridge: /bridge/i, mountain: /mountain|hill/i,
+      'parking meter': /parking\s*meter/i, 'palm tree': /palm\s*tree/i,
+      taxi: /taxi|cab/i, tractor: /tractor/i, sidewalk: /sidewalk|pavement/i,
+      truck: /truck/i, van: /van/i, train: /train|subway|metro|tram/i,
+      boat: /boat|ship/i, airplane: /airplane|plane|aircraft/i,
+      dog: /dog|puppy/i, cat: /cat|kitten/i, horse: /horse|pony/i,
+      bird: /bird/i, bear: /bear/i, elephant: /elephant/i, zebra: /zebra/i,
+      'stop sign': /stop\s*sign/i, bench: /bench/i, mailbox: /mail\s*box|post\s*box/i,
+      storefront: /storefront|shop/i, chimney: /chimney/i, playground: /playground/i,
+      tower: /tower/i, fountain: /fountain/i, 'swimming pool': /swimming\s*pool|pool/i,
+      building: /building|house|apartment/i, road: /road|street/i,
+      water: /water|ocean|sea|lake|river/i, snow: /snow/i, cloud: /cloud/i,
+      tree: /tree|forest/i, person: /person|people|pedestrian|human/i,
+      'road sign': /road\s*sign|traffic\s*sign|sign/i, motorway: /motorway|freeway|highway/i,
+      animal: /animal|creature/i,
+    };
+    for (const [cat, re] of Object.entries(map)) { if (re.test(t)) return cat; }
+    const m = t.match(/(?:select|click|tap|choose)\s+(?:all\s+)?(?:images?\s+)?(?:with|of|containing|that\s+show)\s+(.+?)(?:\.|$|,|if|and)/i);
+    return m ? m[1].trim() : '';
+  }
+
+  function getTiles(gridType) {
+    const tiles = [];
+    if (gridType === 'recaptcha') {
+      document.querySelectorAll('.rc-imageselect-tile').forEach((tile, i) => {
+        const img = tile.querySelector('img');
+        if (img && img.src) tiles.push({ tile, img, i, src: img.src });
       });
-      this.observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-    },
+    } else if (gridType === 'hcaptcha') {
+      document.querySelectorAll('.task-image').forEach((tile, i) => {
+        const img = tile.querySelector('img');
+        if (img && img.src) { tiles.push({ tile, img, i, src: img.src }); return; }
+        const bg = getComputedStyle(tile).backgroundImage;
+        const m = bg?.match(/url\(["']?([^"')]+)["']?\)/);
+        if (m) tiles.push({ tile, img: tile, i, src: m[1] });
+      });
+    }
+    return tiles;
+  }
 
-    autoSubmitForm() {
-      const btn = document.querySelector('input[type="submit"], button[type="submit"], .submit-button, button.submit');
-      if (btn && !btn.disabled) {
-        Utils.humanDelay(500, 1500).then(() => { Utils.clickElement(btn); Logger.info('Form auto-submitted'); });
+  // ===== SOLVE CHALLENGE =====
+  async function solveChallenge(gridType) {
+    const text = getChallengeText();
+    if (!text) { L.w('No challenge text'); return null; }
+
+    const category = parseCategory(text);
+    if (!category) { L.w('Cannot parse category from:', text); return null; }
+
+    L.c(`"${text}" => "${category}"`);
+
+    const tiles = getTiles(gridType);
+    if (tiles.length === 0) { L.w('No tiles'); return null; }
+
+    L.a(`${tiles.length} tiles, classifying "${category}"`);
+
+    const allLabels = [category, 'traffic light', 'crosswalk', 'bicycle', 'bus', 'car', 'motorcycle',
+      'fire hydrant', 'stairs', 'bridge', 'mountain', 'parking meter', 'palm tree',
+      'taxi', 'tractor', 'sidewalk', 'truck', 'van', 'train', 'boat', 'airplane',
+      'dog', 'cat', 'horse', 'bear', 'stop sign', 'bench', 'mailbox', 'storefront',
+      'chimney', 'playground', 'tower', 'fountain', 'swimming pool', 'building',
+      'road', 'water', 'snow', 'tree', 'person', 'road sign', 'animal'];
+
+    const clicked = [];
+    const threshold = getConfig().ai.confidenceThreshold;
+
+    for (const t of tiles) {
+      const b64 = await fetchImage(t.src);
+      if (!b64) { L.d(`Tile ${t.i}: fetch failed`); continue; }
+
+      const scores = await hfClassify(b64, allLabels);
+      const score = scores[category] || 0;
+      L.a(`Tile ${t.i}: "${category}" = ${score.toFixed(3)} (min: ${threshold})`);
+
+      if (score >= threshold) {
+        L.a(`=> CLICK tile ${t.i}`);
+        await hDelay(200, 500);
+        await click(t.tile);
+        clicked.push(t.i);
+        await hDelay(150, 300);
       }
-    },
+    }
 
-    updatePanelStats() {
-      const solvedEl = document.getElementById('cs-solved-count');
-      const failedEl = document.getElementById('cs-failed-count');
-      if (solvedEl) solvedEl.textContent = this.solvedCount;
-      if (failedEl) failedEl.textContent = this.failedCount;
-    },
-  };
+    L.c(`Clicked ${clicked.length} tiles: [${clicked.join(',')}]`);
+    if (clicked.length === 0) return false;
 
-  const ControlPanel = {
-    init() {
-      this.injectStyles();
-      this.createPanel();
-    },
+    await hDelay(800, 1500);
+    const btn = document.querySelector('#recaptcha-verify-button, .verify-button, [class*="verify"], .submit-button, [class*="submit"]');
+    if (btn) { L.i('Click Verify'); await hDelay(300, 600); await click(btn); return true; }
+    return true;
+  }
 
-    injectStyles() {
-      GM_addStyle(`
-        #cs-panel { position:fixed; top:10px; right:10px; z-index:2147483647; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; font-size:12px; }
-        #cs-toggle { width:40px; height:40px; border-radius:50%; background:linear-gradient(135deg,#667eea,#764ba2); border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 15px rgba(102,126,234,.4); color:#fff; font-size:18px; transition:transform .2s; }
-        #cs-toggle:hover { transform:scale(1.1); }
-        #cs-content { display:none; position:absolute; top:50px; right:0; width:260px; background:#1a1a2e; border-radius:12px; box-shadow:0 10px 40px rgba(0,0,0,.5); color:#fff; overflow:hidden; }
-        #cs-content.open { display:block; }
-        #cs-content .hdr { background:linear-gradient(135deg,#667eea,#764ba2); padding:12px 15px; display:flex; justify-content:space-between; align-items:center; }
-        #cs-content .hdr h3 { margin:0; font-size:13px; }
-        #cs-content .body { padding:12px; max-height:400px; overflow-y:auto; }
-        #cs-content .stat { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid rgba(255,255,255,.1); }
-        #cs-content .row { display:flex; justify-content:space-between; align-items:center; padding:5px 0; }
-        #cs-content .sw { position:relative; width:36px; height:20px; flex-shrink:0; }
-        #cs-content .sw input { opacity:0; width:0; height:0; }
-        #cs-content .sw .sl { position:absolute; inset:0; background:#444; border-radius:20px; cursor:pointer; transition:.3s; }
-        #cs-content .sw .sl::before { position:absolute; content:""; height:14px; width:14px; left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.3s; }
-        #cs-content .sw input:checked+.sl { background:#667eea; }
-        #cs-content .sw input:checked+.sl::before { transform:translateX(16px); }
-        #cs-content .btn { width:100%; padding:8px; margin-top:8px; background:linear-gradient(135deg,#667eea,#764ba2); border:none; border-radius:6px; color:#fff; cursor:pointer; font-weight:700; font-size:12px; }
-        #cs-content .btn:hover { opacity:.9; }
-        #cs-content .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
-        #cs-content .dot.on { background:#4CAF50; box-shadow:0 0 8px #4CAF50; }
-        #cs-content .dot.off { background:#F44336; }
-        #cs-content .label { font-size:11px; color:#aaa; margin-top:6px; }
-      `);
-    },
+  // ===== IFRAME SOLVERS =====
+  async function solveRecaptchaFrame() {
+    const cfg = getConfig().recaptcha;
+    for (let round = 0; round < cfg.maxRetries; round++) {
+      await sleep(1500);
+      const text = getChallengeText();
 
-    createPanel() {
-      const c = document.createElement('div');
-      c.id = 'cs-panel';
-      c.innerHTML = `
-        <button id="cs-toggle" title="AI Captcha Solver">&#9968;</button>
-        <div id="cs-content">${this.html()}</div>`;
-      c.querySelector('#cs-toggle').onclick = () => c.querySelector('#cs-content').classList.toggle('open');
+      if (text) {
+        L.c(`Round ${round + 1}: ${text}`);
 
-      const add = () => { document.body.appendChild(c); this.bind(); };
-      document.body ? add() : new MutationObserver((_, obs) => { if (document.body) { obs.disconnect(); add(); } }).observe(document.documentElement, { childList: true });
-    },
+        const t = text.toLowerCase();
+        if (/skip|no\s+images|none|don't\s*see|there\s+are\s+no/i.test(t)) {
+          L.a('No matching, click Verify');
+          const btn = document.querySelector('#recaptcha-verify-button, .verify-button');
+          if (btn) await click(btn);
+          await sleep(3000);
+          if (!getChallengeText()) { L.c('Solved!'); notify('recaptcha'); return; }
+          continue;
+        }
 
-    html() {
-      const cfg = getConfig();
-      const t = (id, label, checked) => `<div class="row"><span>${label}</span><label class="sw"><input type="checkbox" id="cs-${id}" ${checked ? 'checked' : ''}><span class="sl"></span></label></div>`;
-      return `
-        <div class="hdr"><h3>&#9968; AI Captcha Solver v2</h3><span class="dot ${cfg.enabled ? 'on' : 'off'}"></span></div>
-        <div class="body">
-          ${t('enabled', 'Enabled', cfg.enabled)}
-          ${t('autosolve', 'Auto Solve', cfg.autoSolve)}
-          ${t('autosubmit', 'Auto Submit', cfg.autoSubmit)}
-          <div class="stat"><span>Solved</span><span id="cs-solved-count">0</span></div>
-          <div class="stat"><span>Failed</span><span id="cs-failed-count">0</span></div>
-          ${t('recaptcha', 'reCAPTCHA', cfg.recaptcha.enabled)}
-          ${t('hcaptcha', 'hCaptcha', cfg.hcaptcha.enabled)}
-          ${t('turnstile', 'Turnstile', cfg.turnstile.enabled)}
-          ${t('funcaptcha', 'FunCaptcha', cfg.funcaptcha.enabled)}
-          ${t('geetest', 'GeeTest', cfg.geetest.enabled)}
-          ${t('textcaptcha', 'Text OCR', cfg.textCaptcha.enabled)}
-          <div class="label">AI: ${cfg.ai.useHuggingFace ? 'Hugging Face + Tesseract' : 'Disabled'}</div>
-          <button class="btn" id="cs-solve-now">&#9889; Solve Now</button>
-        </div>`;
-    },
+        const ok = await solveChallenge('recaptcha');
+        if (!ok) {
+          L.w('Could not classify tiles, clicking Verify anyway');
+          const btn = document.querySelector('#recaptcha-verify-button, .verify-button');
+          if (btn) await click(btn);
+        }
 
-    bind() {
-      const b = (id, fn) => document.getElementById(id)?.addEventListener('change', fn);
-      b('cs-enabled', e => setConfig('enabled', e.target.checked));
-      b('cs-autosolve', e => setConfig('autoSolve', e.target.checked));
-      b('cs-autosubmit', e => setConfig('autoSubmit', e.target.checked));
-      b('cs-recaptcha', e => { const c = getConfig(); c.recaptcha.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      b('cs-hcaptcha', e => { const c = getConfig(); c.hcaptcha.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      b('cs-turnstile', e => { const c = getConfig(); c.turnstile.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      b('cs-funcaptcha', e => { const c = getConfig(); c.funcaptcha.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      b('cs-geetest', e => { const c = getConfig(); c.geetest.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      b('cs-textcaptcha', e => { const c = getConfig(); c.textCaptcha.enabled = e.target.checked; GM_setValue('captchaSolverConfig', c); });
-      document.getElementById('cs-solve-now')?.addEventListener('click', () => CaptchaSolver.checkForExistingCaptchas());
-    },
-  };
+        await sleep(3000);
+        const nextText = getChallengeText();
+        if (!nextText) { L.c('Solved!'); notify('recaptcha'); return; }
+        if (nextText === text) { L.i('Same text, trying Verify again'); const btn = document.querySelector('#recaptcha-verify-button'); if (btn) await click(btn); await sleep(3000); if (!getChallengeText()) { L.c('Solved!'); notify('recaptcha'); return; } }
+      } else {
+        const cb = document.querySelector('.recaptcha-checkbox, [role="checkbox"], .recaptcha-checkbox-holder');
+        if (cb) { L.c('Clicking checkbox'); await click(cb); await sleep(5000); }
+        if (!getChallengeText()) { L.c('No challenge - solved!'); notify('recaptcha'); return; }
+      }
+    }
+    L.w('Max retries reCAPTCHA');
+  }
 
+  async function solveHCaptchaFrame() {
+    const cfg = getConfig().hcaptcha;
+    for (let round = 0; round < cfg.maxRetries; round++) {
+      await sleep(1500);
+      const text = getChallengeText();
+
+      if (text) {
+        L.c(`hCaptcha: ${text}`);
+        const t = text.toLowerCase();
+        if (/skip|no\s+images|none|don't\s*see/i.test(t)) {
+          const btn = document.querySelector('.verify-button, .submit-button, [class*="verify"]');
+          if (btn) await click(btn);
+          await sleep(3000);
+          if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
+          continue;
+        }
+
+        const ok = await solveChallenge('hcaptcha');
+        if (!ok) {
+          const btn = document.querySelector('.verify-button, .submit-button, [class*="verify"]');
+          if (btn) await click(btn);
+        }
+        await sleep(3000);
+        if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
+      } else {
+        const cb = document.querySelector('.check, .checkbox, [class*="check"]');
+        if (cb) { L.c('Clicking hCaptcha checkbox'); await click(cb); await sleep(5000); }
+        if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
+      }
+    }
+    L.w('Max retries hCaptcha');
+  }
+
+  async function solveTurnstileFrame() {
+    L.c('Turnstile frame');
+    await sleep(2000);
+    const cb = document.querySelector('input[type="checkbox"], .turnstile-checkbox, [class*="checkbox"]');
+    if (cb) { L.c('Clicking Turnstile checkbox'); await click(cb); }
+    await sleep(5000);
+    notify('turnstile');
+  }
+
+  async function solveFunCaptchaFrame() {
+    L.c('FunCaptcha frame');
+    await sleep(2000);
+    const btn = document.querySelector('.play_button, .start-button, [class*="start"]');
+    if (btn) await click(btn);
+    await sleep(2000);
+    const slider = document.querySelector('input[type="range"]');
+    if (slider) {
+      for (let i = 0; i < 3; i++) {
+        slider.value = String(Math.random() * 360);
+        slider.dispatchEvent(new Event('input', { bubbles: true }));
+        slider.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(500);
+      }
+      const sub = document.querySelector('.submit_button, .submit-button');
+      if (sub) await click(sub);
+    }
+    notify('funcaptcha');
+  }
+
+  function notify(type) {
+    try { window.parent.postMessage({ source: 'captcha-solver-v3', type: 'solved', captcha: type }, '*'); } catch {}
+  }
+
+  // ===== MAIN PAGE =====
+  let solvedN = 0, failedN = 0, monObserver = null;
+
+  async function solveMainPage(type) {
+    const cfg = getConfig()[type];
+    if (!cfg?.enabled) return false;
+
+    L.c(`Solving ${type}...`);
+
+    if (type === 'textCaptcha') return await solveTextCaptchaMain();
+    if (type === 'geetest') return await solveGeetestMain();
+
+    // Try to trigger captcha
+    if (type === 'recaptcha' && unsafeWindow.grecaptcha) {
+      for (let i = 0; i < 100; i++) try { unsafeWindow.grecaptcha.execute(i); } catch {}
+    }
+    if (type === 'hcaptcha' && unsafeWindow.hcaptcha) {
+      try { unsafeWindow.hcaptcha.execute(); } catch {}
+    }
+    if (type === 'turnstile' && unsafeWindow.turnstile) {
+      document.querySelectorAll('.cf-turnstile, [class*="turnstile"]').forEach(el => { try { unsafeWindow.turnstile.execute(el); } catch {} });
+    }
+
+    // Wait for iframe to solve itself (if iframe script is running)
+    for (let i = 0; i < 30; i++) {
+      await sleep(2000);
+      if (isSolved(type)) { solvedN++; updPanel(); L.c(`${type} solved!`); if (getConfig().autoSubmit) autoSubmit(); return true; }
+    }
+
+    failedN++; updPanel();
+    return false;
+  }
+
+  function isSolved(type) {
+    if (type === 'recaptcha') return !!document.querySelector('.recaptcha-checkbox[aria-checked="true"]') || !!document.querySelector('.g-recaptcha-response')?.value;
+    if (type === 'hcaptcha') return !!document.querySelector('.h-captcha textarea')?.value;
+    if (type === 'turnstile') return !document.querySelector('iframe[src*="challenges.cloudflare.com"]') || !!document.querySelector('[data-turnstile-success]');
+    return false;
+  }
+
+  async function solveTextCaptchaMain() {
+    const input = document.querySelector('input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i], input[name*="verification" i]');
+    if (!input) return false;
+    const img = document.querySelector('img[src*="captcha" i], img[src*="captchaImage" i], img[src*="code" i]');
+    if (!img) return false;
+    const text = await runOCR(img);
+    const cleaned = text.replace(/[^a-zA-Z0-9]/g, '').substring(0, 10);
+    if (cleaned.length >= 2) {
+      input.value = cleaned;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      L.c(`OCR filled: "${cleaned}"`);
+      solvedN++; updPanel();
+      return true;
+    }
+    failedN++; updPanel();
+    return false;
+  }
+
+  async function solveGeetestMain() {
+    const slider = document.querySelector('.geetest_slider_button, .gt_slider_knob, [class*="slider"]');
+    if (!slider) return false;
+    await hDelay(500, 1000);
+    const r = slider.getBoundingClientRect();
+    const sx = r.left + r.width / 2, sy = r.top + r.height / 2;
+    slider.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: sx, clientY: sy }));
+    await sleep(80);
+    const tx = sx + 150 + Math.random() * 100;
+    for (let i = 1; i <= 25; i++) {
+      const p = i / 25, e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      slider.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx + (tx - sx) * e, clientY: sy + (Math.random() - 0.5) * 5 }));
+      await sleep(20 + Math.random() * 15);
+    }
+    slider.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: tx, clientY: sy }));
+    L.c('GeeTest done'); solvedN++; updPanel(); return true;
+  }
+
+  function autoSubmit() {
+    const btn = document.querySelector('input[type="submit"], button[type="submit"], .submit-button');
+    if (btn && !btn.disabled) hDelay(300, 800).then(() => { click(btn); L.i('Form submitted'); });
+  }
+
+  function checkExisting() {
+    const type = isInIframe() ? getIframeType() : getPageType();
+    if (type && getConfig().autoSolve && getConfig().enabled) solveMainOrFrame(type);
+  }
+
+  async function solveMainOrFrame(type) {
+    if (isInIframe()) {
+      L.c(`=== In ${type} iframe ===`);
+      if (type === 'recaptcha') await solveRecaptchaFrame();
+      else if (type === 'hcaptcha') await solveHCaptchaFrame();
+      else if (type === 'turnstile') await solveTurnstileFrame();
+      else if (type === 'funcaptcha') await solveFunCaptchaFrame();
+    } else {
+      await solveMainPage(type);
+    }
+  }
+
+  function startMonitor() {
+    monObserver = new MutationObserver(mutations => {
+      let found = false;
+      for (const m of mutations) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (n.tagName === 'IFRAME' && /recaptcha|hcaptcha|turnstile|funcaptcha|arkose|geetest|captcha/i.test(n.src || '')) { found = true; break; }
+          if (n.querySelector?.('.g-recaptcha, .h-captcha, .cf-turnstile, .geetest')) { found = true; break; }
+        }
+        if (found) break;
+      }
+      if (found && getConfig().autoSolve && getConfig().enabled) {
+        L.i('Captcha detected');
+        setTimeout(() => checkExisting(), 1000);
+      }
+    });
+    monObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  }
+
+  // ===== PANEL =====
+  function createPanel() {
+    GM_addStyle(`
+      #cs-v3{position:fixed;top:10px;right:10px;z-index:2147483647;font:12px -apple-system,sans-serif}
+      #cs-v3 button{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#667eea,#764ba2);border:none;cursor:pointer;color:#fff;font-size:16px;box-shadow:0 3px 12px rgba(102,126,234,.4)}
+      #cs-v3 button:hover{transform:scale(1.1)}
+      #cs-v3-p{display:none;position:absolute;top:48px;right:0;width:240px;background:#1a1a2e;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#fff}
+      #cs-v3-p.open{display:block}
+      #cs-v3-p .hd{background:linear-gradient(135deg,#667eea,#764ba2);padding:8px 12px;display:flex;justify-content:space-between;align-items:center}
+      #cs-v3-p .hd h3{margin:0;font-size:11px}
+      #cs-v3-p .bd{padding:8px;max-height:320px;overflow-y:auto}
+      #cs-v3-p .r{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:11px}
+      #cs-v3-p .sw{position:relative;width:30px;height:16px}
+      #cs-v3-p .sw input{opacity:0;width:0;height:0}
+      #cs-v3-p .sw label{position:absolute;inset:0;background:#444;border-radius:16px;cursor:pointer;transition:.3s}
+      #cs-v3-p .sw label::before{position:absolute;content:"";height:10px;width:10px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+      #cs-v3-p .sw input:checked+label{background:#667eea}
+      #cs-v3-p .sw input:checked+label::before{transform:translateX(14px)}
+      #cs-v3-p .btn{width:100%;padding:6px;margin-top:5px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:700;font-size:10px}
+      #cs-v3-p .st{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:10px}
+      #cs-v3-p .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+      #cs-v3-p .dot.g{background:#4CAF50;box-shadow:0 0 4px #4CAF50}
+      #cs-v3-p .dot.r{background:#F44336}
+    `);
+
+    const p = document.createElement('div');
+    p.id = 'cs-v3';
+    p.innerHTML = `<button id="cs-v3-b">&#9968;</button><div id="cs-v3-p">${panelHTML()}</div>`;
+    p.querySelector('#cs-v3-b').onclick = () => p.querySelector('#cs-v3-p').classList.toggle('open');
+
+    const add = () => { document.body.appendChild(p); bindPanel(); };
+    document.body ? add() : new MutationObserver((_, o) => { if (document.body) { o.disconnect(); add(); } }).observe(document.documentElement, { childList: true });
+  }
+
+  function panelHTML() {
+    const c = getConfig();
+    const sw = (id, label, on) => `<div class="r"><span>${label}</span><div class="sw"><input type="checkbox" id="cs-${id}" ${on ? 'checked' : ''}><label for="cs-${id}"></label></div></div>`;
+    return `<div class="hd"><h3>&#9968; AI Captcha v3</h3><span class="dot ${c.enabled ? 'g' : 'r'}"></span></div>
+      <div class="bd">
+        ${sw('enabled', 'Enabled', c.enabled)}${sw('autosolve', 'Auto Solve', c.autoSolve)}${sw('autosubmit', 'Auto Submit', c.autoSubmit)}
+        <div class="st"><span>Solved</span><span id="cs-ok">0</span></div>
+        <div class="st"><span>Failed</span><span id="cs-fail">0</span></div>
+        ${sw('recaptcha', 'reCAPTCHA', c.recaptcha.enabled)}${sw('hcaptcha', 'hCaptcha', c.hcaptcha.enabled)}
+        ${sw('turnstile', 'Turnstile', c.turnstile.enabled)}${sw('funcaptcha', 'FunCaptcha', c.funcaptcha.enabled)}
+        ${sw('geetest', 'GeeTest', c.geetest.enabled)}${sw('textcaptcha', 'Text OCR', c.textCaptcha.enabled)}
+        <div style="font-size:9px;color:#666;margin-top:3px">AI: ${c.ai.useHuggingFace ? 'HF CLIP + Tesseract' : 'Off'} | Threshold: ${c.ai.confidenceThreshold}</div>
+        <button class="btn" id="cs-go">&#9889; Solve Now</button>
+      </div>`;
+  }
+
+  function bindPanel() {
+    const b = (id, fn) => document.getElementById(id)?.addEventListener('change', fn);
+    b('cs-enabled', e => setConfig('enabled', e.target.checked));
+    b('cs-autosolve', e => setConfig('autoSolve', e.target.checked));
+    b('cs-autosubmit', e => setConfig('autoSubmit', e.target.checked));
+    b('cs-recaptcha', e => { const c = getConfig(); c.recaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    b('cs-hcaptcha', e => { const c = getConfig(); c.hcaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    b('cs-turnstile', e => { const c = getConfig(); c.turnstile.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    b('cs-funcaptcha', e => { const c = getConfig(); c.funcaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    b('cs-geetest', e => { const c = getConfig(); c.geetest.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    b('cs-textcaptcha', e => { const c = getConfig(); c.textCaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
+    document.getElementById('cs-go')?.addEventListener('click', () => checkExisting());
+  }
+
+  function updPanel() {
+    const o = document.getElementById('cs-ok'), f = document.getElementById('cs-fail');
+    if (o) o.textContent = solvedN; if (f) f.textContent = failedN;
+  }
+
+  // ===== INIT =====
   function init() {
-    CaptchaSolver.init();
-    ControlPanel.init();
+    const iframeType = getIframeType();
+    const pageType = getPageType();
+
+    if (isInIframe() && iframeType) {
+      L.c(`=== Running in ${iframeType} iframe ===`);
+      sleep(800).then(() => solveMainOrFrame(iframeType));
+    } else if (pageType) {
+      L.c(`=== Main page: ${pageType} ===`);
+      createPanel();
+      startMonitor();
+      sleep(500).then(() => checkExisting());
+    } else {
+      L.d('No captcha detected on load');
+      createPanel();
+      startMonitor();
+    }
+
+    window.addEventListener('message', e => {
+      if (e.data?.source === 'captcha-solver-v3' && e.data.type === 'solved') {
+        solvedN++; updPanel();
+        L.c(`${e.data.captcha} solved via iframe!`);
+        if (getConfig().autoSubmit) autoSubmit();
+        if (getConfig().notifications) GM_notification({ text: `${e.data.captcha} solved!`, title: 'AI Captcha Solver', timeout: 3000 });
+      }
+    });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 
   unsafeWindow.CaptchaSolver = {
-    solve: (t) => CaptchaSolver.solve(t),
-    detect: () => CaptchaSolver.detectCaptcha(),
-    getConfig: () => getConfig(),
-    setConfig: (k, v) => setConfig(k, v),
-    stats: () => ({ solved: CaptchaSolver.solvedCount, failed: CaptchaSolver.failedCount }),
-    runOCR: (img) => Utils.runOCR(img),
-    classifyImage: (src, labels) => Utils.classifyImage(src, labels),
+    solve: solveMainOrFrame, detect: () => isInIframe() ? getIframeType() : getPageType(),
+    getConfig, setConfig, stats: () => ({ solved: solvedN, failed: failedN }),
+    runOCR, classifyImage: hfClassify,
   };
 
 })();
