@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI Captcha Solver - Free Universal Solver v3
+// @name         AI Captcha Solver
 // @namespace    Terminator.Scripts
-// @version      3.1.0
-// @description  AI captcha solver running inside captcha iframes. Tesseract.js OCR + Hugging Face CLIP AI. Zero API key, zero limits.
+// @version      4.0.0
+// @description  Auto-solve captchas with AI. Tesseract OCR + Hugging Face CLIP. Zero API key.
 // @author       TERMINATOR
 // @match        *://*/*
 // @match        https://www.google.com/recaptcha/api2/*
@@ -11,8 +11,6 @@
 // @match        https://assets.hcaptcha.com/captcha/v1/*
 // @match        https://challenges.cloudflare.com/cdn-cgi/challenge-platform/*
 // @match        https://challenges.cloudflare.com/turnstile/*
-// @match        https://*.funcaptcha.com/*
-// @match        https://*.arkoselabs.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
@@ -21,298 +19,359 @@
 // @grant        unsafeWindow
 // @connect      huggingface.co
 // @connect      api-inference.huggingface.co
-// @connect      cdn.jsdelivr.net
 // @connect      tesseract.projectnaptha.com
-// @run-at       document-start
-// @downloadURL  https://github.com/terminator1626/captcha-solver/blob/main/ai-captcha-solver.user.js
-// @updateURL    https://github.com/terminator1626/captcha-solver/blob/main/ai-captcha-solver.user.js
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const DEFAULT_CONFIG = {
+  const CFG_KEY = 'cs_v4';
+  const CFG = {
     enabled: true,
     autoSolve: true,
     autoSubmit: false,
-    humanizeDelay: true,
-    notifications: true,
-    recaptcha: { enabled: true, maxRetries: 5 },
-    hcaptcha: { enabled: true, maxRetries: 5 },
-    turnstile: { enabled: true, maxRetries: 3 },
-    funcaptcha: { enabled: true, maxRetries: 3 },
-    geetest: { enabled: true },
-    textCaptcha: { enabled: true },
-    ai: {
-      useHuggingFace: true,
-      ocrLanguage: 'eng',
-      confidenceThreshold: 0.35,
-      hfRetries: 3,
-      hfTimeout: 45000,
-      hfWaitOnLoading: 20,
-    },
+    threshold: 0.40,
+    hfRetries: 4,
+    hfWait: 15,
+    maxRounds: 8,
+    ocrLang: 'eng',
     logLevel: 'info',
   };
 
-  const LOG_COLORS = { debug: '#888', info: '#4CAF50', warn: '#FF9800', error: '#F44336', ai: '#00E5FF', captcha: '#E040FB' };
-
-  function getConfig() {
-    try { const s = GM_getValue('cs_config'); return s ? deepMerge(DEFAULT_CONFIG, s) : JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
-    catch { return JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
+  function loadCfg() {
+    try { const s = GM_getValue(CFG_KEY); return s ? { ...CFG, ...s } : { ...CFG }; }
+    catch { return { ...CFG }; }
   }
 
-  function deepMerge(base, ov) {
-    const out = { ...base };
-    for (const k of Object.keys(ov)) {
-      if (ov[k] && typeof ov[k] === 'object' && !Array.isArray(ov[k])) out[k] = deepMerge(base[k] || {}, ov[k]);
-      else out[k] = ov[k];
-    }
-    return out;
-  }
-
-  function setConfig(key, val) {
-    const c = getConfig(); const p = key.split('.'); let o = c;
-    for (let i = 0; i < p.length - 1; i++) o = o[p[i]];
-    o[p[p.length - 1]] = val; GM_setValue('cs_config', c);
-  }
-
+  const C = loadCfg();
+  const LOG_C = { debug: '#888', info: '#4CAF50', warn: '#FF9800', error: '#F44336', ai: '#00E5FF', cap: '#E040FB' };
+  const log = (lvl, ...a) => {
+    const lvls = ['debug', 'info', 'warn', 'error'];
+    if (lvls.indexOf(lvl) < lvls.indexOf(C.logLevel)) return;
+    console.log(`%c[CS]`, `color:${LOG_C[lvl]};font-weight:bold;`, ...a);
+  };
   const L = {
-    _log(lvl, ...a) {
-      const cfg = getConfig(); const lvls = ['debug', 'info', 'warn', 'error'];
-      if (lvls.indexOf(lvl) < lvls.indexOf(cfg.logLevel)) return;
-      console.log(`%c[CS]`, `color:${LOG_COLORS[lvl]};font-weight:bold;background:#000;padding:2px 6px;border-radius:3px;`, ...a);
-    },
-    d(...a) { this._log('debug', ...a); }, i(...a) { this._log('info', ...a); },
-    w(...a) { this._log('warn', ...a); }, e(...a) { this._log('error', ...a); },
-    a(...a) { this._log('ai', ...a); }, c(...a) { this._log('captcha', ...a); },
+    d: (...a) => log('debug', ...a), i: (...a) => log('info', ...a),
+    w: (...a) => log('warn', ...a), e: (...a) => log('error', ...a),
+    a: (...a) => log('ai', ...a), c: (...a) => log('cap', ...a),
   };
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const hDelay = async (min = 300, max = 900) => {
-    const d = getConfig().humanizeDelay ? min + Math.random() * (max - min) : min;
-    await sleep(d);
-  };
+  const hDelay = async (min = 200, max = 600) => await sleep(min + Math.random() * (max - min));
 
   async function click(el) {
     if (!el || el.disabled || el.offsetParent === null) return false;
-    await hDelay(50, 150);
+    await hDelay(30, 100);
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, view: window }));
-    await sleep(40);
+    await sleep(30);
     el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, view: window }));
-    await sleep(40);
+    await sleep(30);
     el.dispatchEvent(new MouseEvent('click', { bubbles: true, view: window }));
     return true;
   }
 
-  function isInIframe() {
-    try { return window.location !== window.parent.location; } catch { return true; }
-  }
+  function inIframe() { try { return window.location !== window.parent.location; } catch { return true; } }
 
-  function getIframeType() {
+  function whatAmI() {
     try {
       const h = window.location.href;
-      if (/recaptcha\.net|google\.com\/recaptcha/i.test(h)) return 'recaptcha';
+      if (/google\.com\/recaptcha|recaptcha\.net\/recaptcha/i.test(h)) return 'recaptcha';
       if (/hcaptcha\.com/i.test(h)) return 'hcaptcha';
       if (/challenges\.cloudflare\.com/i.test(h)) return 'turnstile';
       if (/funcaptcha\.com|arkoselabs\.com|arkose\.com/i.test(h)) return 'funcaptcha';
     } catch {}
-    return null;
-  }
-
-  function getPageType() {
-    if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"]')) return 'recaptcha';
-    if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"]')) return 'hcaptcha';
+    // Main page detection
+    if (document.querySelector('.g-recaptcha, iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]')) return 'recaptcha';
+    if (document.querySelector('.h-captcha, iframe[src*="hcaptcha.com"]')) return 'hcaptcha';
     if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')) return 'turnstile';
-    if (document.querySelector('.geetest, iframe[src*="geetest"]')) return 'geetest';
-    if (document.querySelector('input[name*="captcha" i], input[id*="captcha" i]')) return 'textCaptcha';
+    if (document.querySelector('.geetest')) return 'geetest';
+    if (document.querySelector('input[name*="captcha" i]') && document.querySelector('img[src*="captcha" i]')) return 'textCaptcha';
     return null;
   }
 
-  // ===== TESSERACT.JS LOADER =====
-  let TesseractLoaded = false;
-  async function loadTesseract() {
-    if (TesseractLoaded || (typeof Tesseract !== 'undefined')) { TesseractLoaded = true; return; }
+  // ====== IMAGE FETCH ======
+  async function fetchImg(src) {
     return new Promise((resolve) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-      s.onload = () => { TesseractLoaded = true; resolve(); };
-      s.onerror = () => { L.w('Failed to load Tesseract.js'); resolve(); };
-      (document.head || document.documentElement).appendChild(s);
-    });
-  }
-
-  async function runOCR(img) {
-    await loadTesseract();
-    if (typeof Tesseract === 'undefined') { L.w('Tesseract not available'); return ''; }
-    try {
-      L.a('Running OCR...');
-      const { data: { text } } = await Tesseract.recognize(img, getConfig().ai.ocrLanguage);
-      L.a('OCR result:', text.trim());
-      return text.trim();
-    } catch (e) { L.e('OCR failed:', e); return ''; }
-  }
-
-  // ===== HF AI =====
-  async function fetchImage(src) {
-    return new Promise((resolve) => {
-      if (src.startsWith('data:')) { resolve(src); return; }
+      if (src.startsWith('data:')) {
+        const idx = src.indexOf('base64,');
+        resolve(idx >= 0 ? src.slice(idx + 7) : src.split(',')[1] || '');
+        return;
+      }
       GM_xmlhttpRequest({
-        method: 'GET', url: src, responseType: 'blob', timeout: 10000,
+        method: 'GET', url: src, responseType: 'arraybuffer', timeout: 10000,
         onload(r) {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = () => resolve(null);
-          reader.readAsDataURL(r.response);
+          const bytes = new Uint8Array(r.response);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          resolve(btoa(binary));
         },
         onerror: () => resolve(null), ontimeout: () => resolve(null),
       });
     });
   }
 
-  async function hfClassify(b64Image, labels) {
-    const ai = getConfig().ai;
-    if (!ai.useHuggingFace) return {};
+  // ====== HF AI ======
+  async function hfClassify(rawBase64, labels) {
+    if (!rawBase64) return {};
 
-    const reqs = [
-      { url: 'https://api-inference.huggingface.co/models/openai/clip-vit-large-patch14', zeroShot: true },
-      { url: 'https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32', zeroShot: true },
+    const labelsStr = labels.filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).slice(0, 20);
+    if (labelsStr.length === 0) return {};
+
+    const models = [
+      'openai/clip-vit-large-patch14',
+      'openai/clip-vit-base-patch32',
+      'openai/clip-vit-large-patch14-336',
     ];
 
-    for (const { url, zeroShot } of reqs) {
-      for (let attempt = 0; attempt < ai.hfRetries; attempt++) {
+    for (const model of models) {
+      for (let attempt = 0; attempt < C.hfRetries; attempt++) {
         try {
           const body = JSON.stringify({
-            inputs: b64Image,
-            parameters: { candidate_labels: labels },
+            inputs: rawBase64,
+            parameters: { candidate_labels: labelsStr },
           });
 
-          const result = await new Promise((resolve, reject) => {
+          const resp = await new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
-              method: 'POST', url, headers: { 'Content-Type': 'application/json' },
-              data: body, responseType: 'text', timeout: ai.hfTimeout,
+              method: 'POST',
+              url: `https://api-inference.huggingface.co/models/${model}`,
+              headers: { 'Content-Type': 'application/json' },
+              data: body,
+              responseType: 'text',
+              timeout: 45000,
               onload(r) { try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('parse')); } },
-              onerror: reject, ontimeout: () => reject(new Error('timeout')),
+              onerror: reject,
+              ontimeout: () => reject(new Error('timeout')),
             });
           });
 
-          if (result.error) {
-            L.d(`HF ${url.split('/').pop()}: ${result.error}`);
-            if (result.error.includes('loading') && result.estimated_time) {
-              const wait = Math.min(Math.ceil(result.estimated_time) * 1000, ai.hfWaitOnLoading * 1000);
-              L.a(`Model loading, waiting ${(wait / 1000).toFixed(0)}s`);
-              await sleep(wait);
+          if (resp.error) {
+            L.d(`HF ${model}: ${resp.error}`);
+            if (resp.error.includes('loading') && resp.estimated_time) {
+              const w = Math.min(Math.ceil(resp.estimated_time) * 1000, C.hfWait * 1000);
+              L.a(`Model loading, waiting ${Math.round(w / 1000)}s`);
+              await sleep(w);
               continue;
             }
-            if (result.error.includes('rate') || result.error.includes('overloaded')) {
-              L.w('HF rate limited, waiting 5s');
-              await sleep(5000);
-              continue;
+            if (resp.error.includes('rate') || resp.error.includes('overloaded')) {
+              L.w('Rate limited, wait 5s'); await sleep(5000); continue;
             }
+            if (resp.error.includes('image input') || resp.error.includes('text input')) break;
             break;
           }
 
-          if (Array.isArray(result)) {
-            const s = {}; for (const i of result) s[i.label] = i.score;
-            L.a('HF scores:', s);
+          if (Array.isArray(resp)) {
+            const s = {}; for (const i of resp) s[i.label] = i.score;
+            L.a(`HF:`, s);
             return s;
           }
-          if (result.scores && result.labels) {
-            const s = {}; for (let i = 0; i < result.labels.length; i++) s[result.labels[i]] = result.scores[i];
-            L.a('HF scores:', s);
+          if (resp.scores && resp.labels) {
+            const s = {}; for (let i = 0; i < resp.labels.length; i++) s[resp.labels[i]] = resp.scores[i];
+            L.a(`HF:`, s);
             return s;
           }
-          if (result.score) { L.a('HF:', result); return { [result.label]: result.score }; }
+          if (resp.score) { L.a(`HF:`, resp); return { [resp.label]: resp.score }; }
 
-          L.d('Unexpected HF response:', JSON.stringify(result).slice(0, 150));
+          L.d('Unexpected:', JSON.stringify(resp).slice(0, 150));
           break;
         } catch (e) {
-          L.d(`HF attempt ${attempt + 1} failed:`, e.message);
-          if (attempt < ai.hfRetries - 1) await sleep(1500);
+          L.d(`Attempt ${attempt + 1}: ${e.message}`);
+          if (attempt < C.hfRetries - 1) await sleep(1000);
         }
       }
     }
-    L.w('All HF models failed');
     return {};
   }
 
-  // ===== CHALLENGE PARSING =====
+  // ====== CATEGORY PARSING ======
+  function parseChallengeText(text) {
+    if (!text || text.length < 3) return '';
+    const t = text.toLowerCase().replace(/[.!?,;:]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    const map = {
+      'traffic light': /traffic\s*light|traffic\s*signal/i,
+      'crosswalk': /crosswalk|pedestrian\s*crossing|zebra\s*crossing/i,
+      'bicycle': /bicyc|bike/i,
+      'bus': /\bbus\b|buses/i,
+      'car': /\bcar\b|\bcars\b|vehicle|vehicles/i,
+      'motorcycle': /motorcyc|motorbike/i,
+      'fire hydrant': /fire\s*hydrant|fireplug|hydrant/i,
+      'stairs': /stair|steps|staircase/i,
+      'bridge': /\bbridge\b|overpass/i,
+      'mountain': /\bmountain\b|mountains|hill/i,
+      'parking meter': /parking\s*meter/i,
+      'palm tree': /palm\s*tree|palm\s*trees/i,
+      'taxi': /\btaxi\b|taxis|\bcab\b|cabs/i,
+      'tractor': /tractor/i,
+      'sidewalk': /sidewalk|pavement/i,
+      'truck': /\btruck\b|trucks|lorry/i,
+      'van': /\bvan\b|vans/i,
+      'train': /\btrain\b|trains|subway|metro|tram/i,
+      'boat': /\bboat\b|boats|ship|ships/i,
+      'airplane': /airplane|airplanes|plane|aircraft/i,
+      'dog': /\bdog\b|dogs|puppy|puppies/i,
+      'cat': /\bcat\b|cats|kitten|kittens/i,
+      'horse': /\bhorse\b|horses|pony/i,
+      'bird': /\bbird\b|birds/i,
+      'bear': /\bbear\b|bears|grizzly/i,
+      'elephant': /elephant/i,
+      'zebra': /zebra/i,
+      'giraffe': /giraffe/i,
+      'stop sign': /stop\s*sign/i,
+      'bench': /\bben\b|benches/i,
+      'mailbox': /mail\s*box|mailboxes|postbox|post\s*box/i,
+      'storefront': /storefront|store\s*front|shop|shops/i,
+      'chimney': /chimney|chimneys/i,
+      'playground': /playground/i,
+      'tower': /\btower\b|towers/i,
+      'fountain': /fountain/i,
+      'swimming pool': /swimming\s*pool|\bpool\b/i,
+      'building': /building|buildings|house|houses|apartment/i,
+      'road': /\broad\b|roads|street|streets/i,
+      'water': /water|ocean|sea|lake|river|pond/i,
+      'snow': /snow|snowy/i,
+      'tree': /tree|trees|forest/i,
+      'person': /person|people|pedestrian|pedestrians|human/i,
+      'road sign': /road\s*sign|traffic\s*sign|sign\s*post|stop\s*sign/i,
+      'motorway': /motorway|freeway|highway/i,
+      'animal': /animal|animals/i,
+      'garden': /garden|garden\s*area/i,
+      'beach': /beach|shore/i,
+    };
+
+    for (const [cat, re] of Object.entries(map)) { if (re.test(t)) return cat; }
+
+    const m = t.match(/(?:select|click|tap|choose)\s+(?:all\s+)?(?:images?\s+)?(?:with|of|containing|that\s+(?:show|have|contain|depict))\s+(.+?)(?:\.|$|,|;|\s+if\s+)/i);
+    return m ? m[1].trim() : '';
+  }
+
+  // ====== TILE DETECTION ======
+  function getTiles(type) {
+    const tiles = [];
+
+    if (type === 'recaptcha') {
+      const tileEls = document.querySelectorAll('.rc-imageselect-tile');
+      for (let i = 0; i < tileEls.length; i++) {
+        const tile = tileEls[i];
+        let img = tile.querySelector('img');
+
+        if (!img || !img.src) {
+          const imgs = tile.querySelectorAll('img');
+          for (const im of imgs) {
+            if (im.src && im.src.length > 10) { img = im; break; }
+          }
+        }
+
+        if (!img) {
+          const bg = getComputedStyle(tile).backgroundImage;
+          const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+          if (m) tiles.push({ el: tile, i, src: m[1], isBg: true });
+          continue;
+        }
+
+        let src = img.src;
+        if (src.includes('base64') || src.startsWith('data:')) {
+          tiles.push({ el: tile, i, src, isBg: false });
+        } else if (src) {
+          tiles.push({ el: tile, i, src, isBg: false });
+        }
+      }
+    }
+
+    if (type === 'hcaptcha') {
+      const taskEls = document.querySelectorAll('.task-image');
+      for (let i = 0; i < taskEls.length; i++) {
+        const tile = taskEls[i];
+        let img = tile.querySelector('img');
+
+        if (!img || !img.src) {
+          const bg = getComputedStyle(tile).backgroundImage || getComputedStyle(tile.querySelector('[class*="image"]') || tile).backgroundImage;
+          const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+          if (m) { tiles.push({ el: tile, i, src: m[1], isBg: true }); continue; }
+        }
+
+        if (img && img.src) {
+          tiles.push({ el: tile, i, src: img.src, isBg: false });
+        }
+      }
+
+      if (tiles.length === 0) {
+        const allImgs = document.querySelectorAll('[class*="task"] img');
+        allImgs.forEach((img, i) => {
+          if (img.src) tiles.push({ el: img.closest('[class*="task"]') || img.parentElement || img, i, src: img.src, isBg: false });
+        });
+      }
+    }
+
+    return tiles;
+  }
+
   function getChallengeText() {
     const sels = [
       '#rc-imageselect-target', '.rc-imageselect-instructions', '.rc-imageselect-dynamic-selector',
       '#prompt', '.prompt-text', '.challenge-text', '.instruction-text',
       '[class*="instruction"]', '[class*="prompt"]', '[class*="challenge"]',
       '#challenge-text', '.task-text', '.task-label', '.header-text',
+      '#task-text', '[data-test="challenge-text"]',
     ];
     for (const s of sels) {
       const el = document.querySelector(s);
-      if (el && el.textContent.trim().length > 3) return el.textContent.trim();
+      if (el && el.textContent.trim().length > 5) return el.textContent.trim();
     }
+    // Scan body text
+    const body = document.body?.textContent || '';
+    const m = body.match(/select\s+all\s+(?:images?\s+)?(?:with|of|containing)\s+([^.!?]{3,50})/i);
+    if (m) return 'Select all images with ' + m[1].trim();
     return '';
   }
 
-  function parseCategory(text) {
-    if (!text) return '';
-    const t = text.toLowerCase().replace(/[.!?,]/g, ' ');
-    const map = {
-      'traffic light': /traffic\s*light/i, crosswalk: /crosswalk|pedestrian\s*cross/i,
-      bicycle: /bicyc|bike/i, bus: /bus(es)?/i, car: /car|vehicle/i,
-      motorcycle: /motorcyc|motorbike/i, 'fire hydrant': /fire\s*hydrant|fireplug/i,
-      stairs: /stair|step/i, bridge: /bridge/i, mountain: /mountain|hill/i,
-      'parking meter': /parking\s*meter/i, 'palm tree': /palm\s*tree/i,
-      taxi: /taxi|cab/i, tractor: /tractor/i, sidewalk: /sidewalk|pavement/i,
-      truck: /truck/i, van: /van/i, train: /train|subway|metro|tram/i,
-      boat: /boat|ship/i, airplane: /airplane|plane|aircraft/i,
-      dog: /dog|puppy/i, cat: /cat|kitten/i, horse: /horse|pony/i,
-      bird: /bird/i, bear: /bear/i, elephant: /elephant/i, zebra: /zebra/i,
-      'stop sign': /stop\s*sign/i, bench: /bench/i, mailbox: /mail\s*box|post\s*box/i,
-      storefront: /storefront|shop/i, chimney: /chimney/i, playground: /playground/i,
-      tower: /tower/i, fountain: /fountain/i, 'swimming pool': /swimming\s*pool|pool/i,
-      building: /building|house|apartment/i, road: /road|street/i,
-      water: /water|ocean|sea|lake|river/i, snow: /snow/i, cloud: /cloud/i,
-      tree: /tree|forest/i, person: /person|people|pedestrian|human/i,
-      'road sign': /road\s*sign|traffic\s*sign|sign/i, motorway: /motorway|freeway|highway/i,
-      animal: /animal|creature/i,
-    };
-    for (const [cat, re] of Object.entries(map)) { if (re.test(t)) return cat; }
-    const m = t.match(/(?:select|click|tap|choose)\s+(?:all\s+)?(?:images?\s+)?(?:with|of|containing|that\s+show)\s+(.+?)(?:\.|$|,|if|and)/i);
-    return m ? m[1].trim() : '';
-  }
-
-  function getTiles(gridType) {
-    const tiles = [];
-    if (gridType === 'recaptcha') {
-      document.querySelectorAll('.rc-imageselect-tile').forEach((tile, i) => {
-        const img = tile.querySelector('img');
-        if (img && img.src) tiles.push({ tile, img, i, src: img.src });
-      });
-    } else if (gridType === 'hcaptcha') {
-      document.querySelectorAll('.task-image').forEach((tile, i) => {
-        const img = tile.querySelector('img');
-        if (img && img.src) { tiles.push({ tile, img, i, src: img.src }); return; }
-        const bg = getComputedStyle(tile).backgroundImage;
-        const m = bg?.match(/url\(["']?([^"')]+)["']?\)/);
-        if (m) tiles.push({ tile, img: tile, i, src: m[1] });
-      });
+  function findVerify(type) {
+    if (type === 'recaptcha') {
+      return document.querySelector('#recaptcha-verify-button') ||
+        document.querySelector('[id*="verify"]') ||
+        [...document.querySelectorAll('button')].find(b => /verify/i.test(b.textContent));
     }
-    return tiles;
+    if (type === 'hcaptcha') {
+      return document.querySelector('.verify-button') ||
+        document.querySelector('.submit-button') ||
+        [...document.querySelectorAll('button')].find(b => /verify|submit/i.test(b.textContent || '')) ||
+        [...document.querySelectorAll('[class*="verify"]')]?.[0] ||
+        document.querySelector('[data-test="verify-button"]');
+    }
+    return document.querySelector('#recaptcha-verify-button, .verify-button, [class*="verify"], .submit-button');
   }
 
-  // ===== SOLVE CHALLENGE =====
-  async function solveChallenge(gridType) {
+  function findCheckbox(type) {
+    if (type === 'recaptcha') {
+      return document.querySelector('.recaptcha-checkbox') ||
+        document.querySelector('.recaptcha-checkbox-holder') ||
+        document.querySelector('[role="checkbox"]') ||
+        document.querySelector('.rc-anchor-checkbox');
+    }
+    if (type === 'hcaptcha') {
+      return document.querySelector('.check') ||
+        document.querySelector('.checkbox') ||
+        document.querySelector('.captcha-checkbox') ||
+        document.querySelector('[class*="check"]');
+    }
+    return null;
+  }
+
+  // ====== SOLVE ======
+  async function solveImageChallenge(type) {
     const text = getChallengeText();
-    if (!text) { L.w('No challenge text'); return null; }
+    if (!text) { L.w('No challenge text'); return false; }
 
-    const category = parseCategory(text);
-    if (!category) { L.w('Cannot parse category from:', text); return null; }
-
+    const category = parseChallengeText(text);
+    if (!category) { L.w('No category from:', text); return false; }
     L.c(`"${text}" => "${category}"`);
 
-    const tiles = getTiles(gridType);
-    if (tiles.length === 0) { L.w('No tiles'); return null; }
+    const tiles = getTiles(type);
+    if (tiles.length === 0) { L.w('No tiles found'); return false; }
+    L.c(`${tiles.length} tiles`);
 
-    L.a(`${tiles.length} tiles, classifying "${category}"`);
-
-    const allLabels = [category, 'traffic light', 'crosswalk', 'bicycle', 'bus', 'car', 'motorcycle',
+    const labels = [category, 'traffic light', 'crosswalk', 'bicycle', 'bus', 'car', 'motorcycle',
       'fire hydrant', 'stairs', 'bridge', 'mountain', 'parking meter', 'palm tree',
       'taxi', 'tractor', 'sidewalk', 'truck', 'van', 'train', 'boat', 'airplane',
       'dog', 'cat', 'horse', 'bear', 'stop sign', 'bench', 'mailbox', 'storefront',
@@ -320,153 +379,125 @@
       'road', 'water', 'snow', 'tree', 'person', 'road sign', 'animal'];
 
     const clicked = [];
-    const threshold = getConfig().ai.confidenceThreshold;
 
     for (const t of tiles) {
-      const b64 = await fetchImage(t.src);
-      if (!b64) { L.d(`Tile ${t.i}: fetch failed`); continue; }
+      const b64 = await fetchImg(t.src);
+      if (!b64) { L.d(`Tile ${t.i}: fetch fail`); continue; }
 
-      const scores = await hfClassify(b64, allLabels);
+      const scores = await hfClassify(b64, labels);
       const score = scores[category] || 0;
-      L.a(`Tile ${t.i}: "${category}" = ${score.toFixed(3)} (min: ${threshold})`);
+      L.a(`Tile ${t.i}: "${category}" = ${score.toFixed(3)} (min: ${C.threshold})`);
 
-      if (score >= threshold) {
-        L.a(`=> CLICK tile ${t.i}`);
-        await hDelay(200, 500);
-        await click(t.tile);
+      if (score >= C.threshold) {
+        L.a(`=> CLICK ${t.i}`);
+        await hDelay(150, 400);
+        await click(t.el);
         clicked.push(t.i);
-        await hDelay(150, 300);
+        await hDelay(100, 250);
       }
     }
 
-    L.c(`Clicked ${clicked.length} tiles: [${clicked.join(',')}]`);
-    if (clicked.length === 0) return false;
+    L.c(`Clicked [${clicked.join(',')}]`);
 
-    await hDelay(800, 1500);
-    const btn = document.querySelector('#recaptcha-verify-button, .verify-button, [class*="verify"], .submit-button, [class*="submit"]');
-    if (btn) { L.i('Click Verify'); await hDelay(300, 600); await click(btn); return true; }
-    return true;
+    if (clicked.length > 0) {
+      await hDelay(600, 1200);
+      const btn = findVerify(type);
+      if (btn) { L.c('Click Verify'); await hDelay(200, 400); await click(btn); return true; }
+    }
+
+    return false;
   }
 
-  // ===== IFRAME SOLVERS =====
+  // ====== IFRAME SOLVERS ======
   async function solveRecaptchaFrame() {
-    const cfg = getConfig().recaptcha;
-    for (let round = 0; round < cfg.maxRetries; round++) {
-      await sleep(1500);
+    for (let round = 0; round < C.maxRounds; round++) {
+      await sleep(1000);
       const text = getChallengeText();
 
-      if (text) {
-        L.c(`Round ${round + 1}: ${text}`);
-
-        const t = text.toLowerCase();
-        if (/skip|no\s+images|none|don't\s*see|there\s+are\s+no/i.test(t)) {
-          L.a('No matching, click Verify');
-          const btn = document.querySelector('#recaptcha-verify-button, .verify-button');
-          if (btn) await click(btn);
-          await sleep(3000);
-          if (!getChallengeText()) { L.c('Solved!'); notify('recaptcha'); return; }
-          continue;
-        }
-
-        const ok = await solveChallenge('recaptcha');
-        if (!ok) {
-          L.w('Could not classify tiles, clicking Verify anyway');
-          const btn = document.querySelector('#recaptcha-verify-button, .verify-button');
-          if (btn) await click(btn);
-        }
-
-        await sleep(3000);
-        const nextText = getChallengeText();
-        if (!nextText) { L.c('Solved!'); notify('recaptcha'); return; }
-        if (nextText === text) { L.i('Same text, trying Verify again'); const btn = document.querySelector('#recaptcha-verify-button'); if (btn) await click(btn); await sleep(3000); if (!getChallengeText()) { L.c('Solved!'); notify('recaptcha'); return; } }
-      } else {
-        const cb = document.querySelector('.recaptcha-checkbox, [role="checkbox"], .recaptcha-checkbox-holder');
-        if (cb) { L.c('Clicking checkbox'); await click(cb); await sleep(5000); }
-        if (!getChallengeText()) { L.c('No challenge - solved!'); notify('recaptcha'); return; }
+      if (!text) {
+        const cb = findCheckbox('recaptcha');
+        if (cb) { L.c('Click checkbox'); await click(cb); await sleep(4000); continue; }
+        L.c('No text, no checkbox - done'); notify('recaptcha'); return;
       }
+
+      L.c(`Round ${round + 1}: ${text}`);
+
+      if (/skip|no\s+images|none|don't\s*see|there\s+are\s+no/i.test(text.toLowerCase())) {
+        L.a('Skip, click Verify');
+        const btn = findVerify('recaptcha');
+        if (btn) await click(btn);
+        await sleep(3000);
+        if (!getChallengeText()) { L.c('Done'); notify('recaptcha'); return; }
+        continue;
+      }
+
+      await solveImageChallenge('recaptcha');
+      await sleep(2500);
+
+      if (!getChallengeText()) { L.c('Done'); notify('recaptcha'); return; }
     }
-    L.w('Max retries reCAPTCHA');
+    L.w('Max rounds');
   }
 
   async function solveHCaptchaFrame() {
-    const cfg = getConfig().hcaptcha;
-    for (let round = 0; round < cfg.maxRetries; round++) {
-      await sleep(1500);
+    for (let round = 0; round < C.maxRounds; round++) {
+      await sleep(1000);
       const text = getChallengeText();
 
-      if (text) {
-        L.c(`hCaptcha: ${text}`);
-        const t = text.toLowerCase();
-        if (/skip|no\s+images|none|don't\s*see/i.test(t)) {
-          const btn = document.querySelector('.verify-button, .submit-button, [class*="verify"]');
-          if (btn) await click(btn);
-          await sleep(3000);
-          if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
-          continue;
-        }
-
-        const ok = await solveChallenge('hcaptcha');
-        if (!ok) {
-          const btn = document.querySelector('.verify-button, .submit-button, [class*="verify"]');
-          if (btn) await click(btn);
-        }
-        await sleep(3000);
-        if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
-      } else {
-        const cb = document.querySelector('.check, .checkbox, [class*="check"]');
-        if (cb) { L.c('Clicking hCaptcha checkbox'); await click(cb); await sleep(5000); }
-        if (!getChallengeText()) { L.c('Solved!'); notify('hcaptcha'); return; }
+      if (!text) {
+        const cb = findCheckbox('hcaptcha');
+        if (cb) { L.c('Click checkbox'); await click(cb); await sleep(4000); continue; }
+        L.c('No text, no checkbox - done'); notify('hcaptcha'); return;
       }
+
+      L.c(`hCaptcha: ${text}`);
+
+      if (/skip|no\s+images|none|don't\s*see/i.test(text.toLowerCase())) {
+        const btn = findVerify('hcaptcha');
+        if (btn) await click(btn);
+        await sleep(3000);
+        if (!getChallengeText()) { L.c('Done'); notify('hcaptcha'); return; }
+        continue;
+      }
+
+      await solveImageChallenge('hcaptcha');
+      await sleep(2500);
+
+      if (!getChallengeText()) { L.c('Done'); notify('hcaptcha'); return; }
     }
-    L.w('Max retries hCaptcha');
+    L.w('Max rounds');
   }
 
   async function solveTurnstileFrame() {
-    L.c('Turnstile frame');
-    await sleep(2000);
-    const cb = document.querySelector('input[type="checkbox"], .turnstile-checkbox, [class*="checkbox"]');
-    if (cb) { L.c('Clicking Turnstile checkbox'); await click(cb); }
-    await sleep(5000);
-    notify('turnstile');
+    L.c('Turnstile'); await sleep(2000);
+    const cb = document.querySelector('input[type="checkbox"], [class*="checkbox"]');
+    if (cb) { L.c('Click'); await click(cb); }
+    await sleep(5000); notify('turnstile');
   }
 
   async function solveFunCaptchaFrame() {
-    L.c('FunCaptcha frame');
-    await sleep(2000);
-    const btn = document.querySelector('.play_button, .start-button, [class*="start"]');
-    if (btn) await click(btn);
-    await sleep(2000);
+    L.c('FunCaptcha'); await sleep(2000);
+    const btn = document.querySelector('.play_button, [class*="start"]');
+    if (btn) { await click(btn); await sleep(2000); }
     const slider = document.querySelector('input[type="range"]');
     if (slider) {
-      for (let i = 0; i < 3; i++) {
-        slider.value = String(Math.random() * 360);
-        slider.dispatchEvent(new Event('input', { bubbles: true }));
-        slider.dispatchEvent(new Event('change', { bubbles: true }));
-        await sleep(500);
-      }
-      const sub = document.querySelector('.submit_button, .submit-button');
-      if (sub) await click(sub);
+      for (let i = 0; i < 3; i++) { slider.value = String(Math.random() * 360); slider.dispatchEvent(new Event('input', { bubbles: true })); await sleep(400); }
+      const sub = document.querySelector('[class*="submit"]'); if (sub) await click(sub);
     }
     notify('funcaptcha');
   }
 
   function notify(type) {
-    try { window.parent.postMessage({ source: 'captcha-solver-v3', type: 'solved', captcha: type }, '*'); } catch {}
+    try { window.parent.postMessage({ src: 'cs-v4', type: 'solved', captcha: type }, '*'); } catch {}
+    if (C.notifications) GM_notification({ text: `${type} solved!`, title: 'CS', timeout: 2000 });
   }
 
-  // ===== MAIN PAGE =====
-  let solvedN = 0, failedN = 0, monObserver = null;
+  // ====== MAIN PAGE ======
+  let solvedN = 0, failedN = 0;
 
-  async function solveMainPage(type) {
-    const cfg = getConfig()[type];
-    if (!cfg?.enabled) return false;
+  async function solveMain(type) {
+    if (!C.enabled || !C.autoSolve) return;
 
-    L.c(`Solving ${type}...`);
-
-    if (type === 'textCaptcha') return await solveTextCaptchaMain();
-    if (type === 'geetest') return await solveGeetestMain();
-
-    // Try to trigger captcha
     if (type === 'recaptcha' && unsafeWindow.grecaptcha) {
       for (let i = 0; i < 100; i++) try { unsafeWindow.grecaptcha.execute(i); } catch {}
     }
@@ -474,198 +505,115 @@
       try { unsafeWindow.hcaptcha.execute(); } catch {}
     }
     if (type === 'turnstile' && unsafeWindow.turnstile) {
-      document.querySelectorAll('.cf-turnstile, [class*="turnstile"]').forEach(el => { try { unsafeWindow.turnstile.execute(el); } catch {} });
+      document.querySelectorAll('.cf-turnstile').forEach(el => { try { unsafeWindow.turnstile.execute(el); } catch {} });
     }
+    if (type === 'textCaptcha') return await solveTextCaptcha();
+    if (type === 'geetest') return await solveGeetest();
 
-    // Wait for iframe to solve itself (if iframe script is running)
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 20; i++) {
       await sleep(2000);
-      if (isSolved(type)) { solvedN++; updPanel(); L.c(`${type} solved!`); if (getConfig().autoSubmit) autoSubmit(); return true; }
+      if (isSolved(type)) { solvedN++; L.c(`${type} solved`); if (C.autoSubmit) autoSubmit(); return true; }
     }
-
-    failedN++; updPanel();
-    return false;
+    failedN++; return false;
   }
 
   function isSolved(type) {
     if (type === 'recaptcha') return !!document.querySelector('.recaptcha-checkbox[aria-checked="true"]') || !!document.querySelector('.g-recaptcha-response')?.value;
     if (type === 'hcaptcha') return !!document.querySelector('.h-captcha textarea')?.value;
-    if (type === 'turnstile') return !document.querySelector('iframe[src*="challenges.cloudflare.com"]') || !!document.querySelector('[data-turnstile-success]');
+    if (type === 'turnstile') return !document.querySelector('iframe[src*="challenges.cloudflare.com"]');
     return false;
   }
 
-  async function solveTextCaptchaMain() {
-    const input = document.querySelector('input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i], input[name*="verification" i]');
-    if (!input) return false;
-    const img = document.querySelector('img[src*="captcha" i], img[src*="captchaImage" i], img[src*="code" i]');
-    if (!img) return false;
-    const text = await runOCR(img);
-    const cleaned = text.replace(/[^a-zA-Z0-9]/g, '').substring(0, 10);
-    if (cleaned.length >= 2) {
-      input.value = cleaned;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      L.c(`OCR filled: "${cleaned}"`);
-      solvedN++; updPanel();
-      return true;
-    }
-    failedN++; updPanel();
-    return false;
+  async function solveTextCaptcha() {
+    await loadTesseract();
+    if (typeof Tesseract === 'undefined') return false;
+    const input = document.querySelector('input[name*="captcha" i], input[id*="captcha" i]');
+    const img = document.querySelector('img[src*="captcha" i], img[src*="code" i]');
+    if (!input || !img) return false;
+    try {
+      const { data: { text } } = await Tesseract.recognize(img, C.ocrLang);
+      const cleaned = text.replace(/[^a-zA-Z0-9]/g, '').substring(0, 10);
+      if (cleaned.length >= 2) {
+        input.value = cleaned;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        L.c(`OCR: "${cleaned}"`); solvedN++; return true;
+      }
+    } catch { }
+    failedN++; return false;
   }
 
-  async function solveGeetestMain() {
-    const slider = document.querySelector('.geetest_slider_button, .gt_slider_knob, [class*="slider"]');
-    if (!slider) return false;
-    await hDelay(500, 1000);
-    const r = slider.getBoundingClientRect();
+  async function solveGeetest() {
+    const s = document.querySelector('.geetest_slider_button, .gt_slider_knob');
+    if (!s) return false;
+    const r = s.getBoundingClientRect();
     const sx = r.left + r.width / 2, sy = r.top + r.height / 2;
-    slider.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: sx, clientY: sy }));
+    s.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: sx, clientY: sy }));
     await sleep(80);
     const tx = sx + 150 + Math.random() * 100;
     for (let i = 1; i <= 25; i++) {
       const p = i / 25, e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-      slider.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx + (tx - sx) * e, clientY: sy + (Math.random() - 0.5) * 5 }));
-      await sleep(20 + Math.random() * 15);
+      s.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx + (tx - sx) * e, clientY: sy }));
+      await sleep(25);
     }
-    slider.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: tx, clientY: sy }));
-    L.c('GeeTest done'); solvedN++; updPanel(); return true;
+    s.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: tx, clientY: sy }));
+    L.c('GeeTest done'); solvedN++; return true;
   }
 
   function autoSubmit() {
-    const btn = document.querySelector('input[type="submit"], button[type="submit"], .submit-button');
-    if (btn && !btn.disabled) hDelay(300, 800).then(() => { click(btn); L.i('Form submitted'); });
+    const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+    if (btn && !btn.disabled) setTimeout(() => click(btn), 500);
   }
 
-  function checkExisting() {
-    const type = isInIframe() ? getIframeType() : getPageType();
-    if (type && getConfig().autoSolve && getConfig().enabled) solveMainOrFrame(type);
-  }
-
-  async function solveMainOrFrame(type) {
-    if (isInIframe()) {
-      L.c(`=== In ${type} iframe ===`);
-      if (type === 'recaptcha') await solveRecaptchaFrame();
-      else if (type === 'hcaptcha') await solveHCaptchaFrame();
-      else if (type === 'turnstile') await solveTurnstileFrame();
-      else if (type === 'funcaptcha') await solveFunCaptchaFrame();
-    } else {
-      await solveMainPage(type);
-    }
-  }
-
-  function startMonitor() {
-    monObserver = new MutationObserver(mutations => {
-      let found = false;
-      for (const m of mutations) {
-        for (const n of m.addedNodes) {
-          if (n.nodeType !== 1) continue;
-          if (n.tagName === 'IFRAME' && /recaptcha|hcaptcha|turnstile|funcaptcha|arkose|geetest|captcha/i.test(n.src || '')) { found = true; break; }
-          if (n.querySelector?.('.g-recaptcha, .h-captcha, .cf-turnstile, .geetest')) { found = true; break; }
-        }
-        if (found) break;
-      }
-      if (found && getConfig().autoSolve && getConfig().enabled) {
-        L.i('Captcha detected');
-        setTimeout(() => checkExisting(), 1000);
-      }
+  // ====== TESSERACT ======
+  async function loadTesseract() {
+    if (typeof Tesseract !== 'undefined') return;
+    await new Promise(r => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      s.onload = r; s.onerror = r;
+      (document.head || document.documentElement).appendChild(s);
     });
-    monObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
   }
 
-  // ===== PANEL =====
-  function createPanel() {
-    GM_addStyle(`
-      #cs-v3{position:fixed;top:10px;right:10px;z-index:2147483647;font:12px -apple-system,sans-serif}
-      #cs-v3 button{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#667eea,#764ba2);border:none;cursor:pointer;color:#fff;font-size:16px;box-shadow:0 3px 12px rgba(102,126,234,.4)}
-      #cs-v3 button:hover{transform:scale(1.1)}
-      #cs-v3-p{display:none;position:absolute;top:48px;right:0;width:240px;background:#1a1a2e;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#fff}
-      #cs-v3-p.open{display:block}
-      #cs-v3-p .hd{background:linear-gradient(135deg,#667eea,#764ba2);padding:8px 12px;display:flex;justify-content:space-between;align-items:center}
-      #cs-v3-p .hd h3{margin:0;font-size:11px}
-      #cs-v3-p .bd{padding:8px;max-height:320px;overflow-y:auto}
-      #cs-v3-p .r{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:11px}
-      #cs-v3-p .sw{position:relative;width:30px;height:16px}
-      #cs-v3-p .sw input{opacity:0;width:0;height:0}
-      #cs-v3-p .sw label{position:absolute;inset:0;background:#444;border-radius:16px;cursor:pointer;transition:.3s}
-      #cs-v3-p .sw label::before{position:absolute;content:"";height:10px;width:10px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
-      #cs-v3-p .sw input:checked+label{background:#667eea}
-      #cs-v3-p .sw input:checked+label::before{transform:translateX(14px)}
-      #cs-v3-p .btn{width:100%;padding:6px;margin-top:5px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:700;font-size:10px}
-      #cs-v3-p .st{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:10px}
-      #cs-v3-p .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
-      #cs-v3-p .dot.g{background:#4CAF50;box-shadow:0 0 4px #4CAF50}
-      #cs-v3-p .dot.r{background:#F44336}
-    `);
-
-    const p = document.createElement('div');
-    p.id = 'cs-v3';
-    p.innerHTML = `<button id="cs-v3-b">&#9968;</button><div id="cs-v3-p">${panelHTML()}</div>`;
-    p.querySelector('#cs-v3-b').onclick = () => p.querySelector('#cs-v3-p').classList.toggle('open');
-
-    const add = () => { document.body.appendChild(p); bindPanel(); };
-    document.body ? add() : new MutationObserver((_, o) => { if (document.body) { o.disconnect(); add(); } }).observe(document.documentElement, { childList: true });
+  // ====== MONITOR ======
+  function startMonitor() {
+    let timer = null;
+    const mo = new MutationObserver(() => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        const type = whatAmI();
+        if (type) { L.c(`Detected: ${type}`); solveMain(type); }
+      }, 1500);
+    });
+    mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
   }
 
-  function panelHTML() {
-    const c = getConfig();
-    const sw = (id, label, on) => `<div class="r"><span>${label}</span><div class="sw"><input type="checkbox" id="cs-${id}" ${on ? 'checked' : ''}><label for="cs-${id}"></label></div></div>`;
-    return `<div class="hd"><h3>&#9968; AI Captcha v3</h3><span class="dot ${c.enabled ? 'g' : 'r'}"></span></div>
-      <div class="bd">
-        ${sw('enabled', 'Enabled', c.enabled)}${sw('autosolve', 'Auto Solve', c.autoSolve)}${sw('autosubmit', 'Auto Submit', c.autoSubmit)}
-        <div class="st"><span>Solved</span><span id="cs-ok">0</span></div>
-        <div class="st"><span>Failed</span><span id="cs-fail">0</span></div>
-        ${sw('recaptcha', 'reCAPTCHA', c.recaptcha.enabled)}${sw('hcaptcha', 'hCaptcha', c.hcaptcha.enabled)}
-        ${sw('turnstile', 'Turnstile', c.turnstile.enabled)}${sw('funcaptcha', 'FunCaptcha', c.funcaptcha.enabled)}
-        ${sw('geetest', 'GeeTest', c.geetest.enabled)}${sw('textcaptcha', 'Text OCR', c.textCaptcha.enabled)}
-        <div style="font-size:9px;color:#666;margin-top:3px">AI: ${c.ai.useHuggingFace ? 'HF CLIP + Tesseract' : 'Off'} | Threshold: ${c.ai.confidenceThreshold}</div>
-        <button class="btn" id="cs-go">&#9889; Solve Now</button>
-      </div>`;
-  }
-
-  function bindPanel() {
-    const b = (id, fn) => document.getElementById(id)?.addEventListener('change', fn);
-    b('cs-enabled', e => setConfig('enabled', e.target.checked));
-    b('cs-autosolve', e => setConfig('autoSolve', e.target.checked));
-    b('cs-autosubmit', e => setConfig('autoSubmit', e.target.checked));
-    b('cs-recaptcha', e => { const c = getConfig(); c.recaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    b('cs-hcaptcha', e => { const c = getConfig(); c.hcaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    b('cs-turnstile', e => { const c = getConfig(); c.turnstile.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    b('cs-funcaptcha', e => { const c = getConfig(); c.funcaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    b('cs-geetest', e => { const c = getConfig(); c.geetest.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    b('cs-textcaptcha', e => { const c = getConfig(); c.textCaptcha.enabled = e.target.checked; GM_setValue('cs_config', c); });
-    document.getElementById('cs-go')?.addEventListener('click', () => checkExisting());
-  }
-
-  function updPanel() {
-    const o = document.getElementById('cs-ok'), f = document.getElementById('cs-fail');
-    if (o) o.textContent = solvedN; if (f) f.textContent = failedN;
-  }
-
-  // ===== INIT =====
+  // ====== INIT ======
   function init() {
-    const iframeType = getIframeType();
-    const pageType = getPageType();
+    const iframeType = inIframe() ? whatAmI() : null;
 
-    if (isInIframe() && iframeType) {
-      L.c(`=== Running in ${iframeType} iframe ===`);
-      sleep(800).then(() => solveMainOrFrame(iframeType));
-    } else if (pageType) {
-      L.c(`=== Main page: ${pageType} ===`);
-      createPanel();
-      startMonitor();
-      sleep(500).then(() => checkExisting());
+    if (iframeType) {
+      L.c(`=== ${iframeType} iframe ===`);
+      if (iframeType === 'recaptcha') solveRecaptchaFrame();
+      else if (iframeType === 'hcaptcha') solveHCaptchaFrame();
+      else if (iframeType === 'turnstile') solveTurnstileFrame();
+      else if (iframeType === 'funcaptcha') solveFunCaptchaFrame();
     } else {
-      L.d('No captcha detected on load');
-      createPanel();
-      startMonitor();
+      const pageType = whatAmI();
+      if (pageType) {
+        L.c(`=== Main: ${pageType} ===`);
+        startMonitor();
+        solveMain(pageType);
+      } else {
+        startMonitor();
+      }
     }
 
     window.addEventListener('message', e => {
-      if (e.data?.source === 'captcha-solver-v3' && e.data.type === 'solved') {
-        solvedN++; updPanel();
-        L.c(`${e.data.captcha} solved via iframe!`);
-        if (getConfig().autoSubmit) autoSubmit();
-        if (getConfig().notifications) GM_notification({ text: `${e.data.captcha} solved!`, title: 'AI Captcha Solver', timeout: 3000 });
+      if (e.data?.src === 'cs-v4' && e.data.type === 'solved') {
+        solvedN++; L.c(`${e.data.captcha} solved!`);
+        if (C.autoSubmit) autoSubmit();
       }
     });
   }
@@ -673,10 +621,10 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  unsafeWindow.CaptchaSolver = {
-    solve: solveMainOrFrame, detect: () => isInIframe() ? getIframeType() : getPageType(),
-    getConfig, setConfig, stats: () => ({ solved: solvedN, failed: failedN }),
-    runOCR, classifyImage: hfClassify,
+  unsafeWindow.CS = {
+    solve: solveMain, detect: whatAmI,
+    stats: () => ({ solved: solvedN, failed: failedN }),
+    runOCR: (img) => typeof Tesseract !== 'undefined' ? Tesseract.recognize(img, C.ocrLang) : null,
   };
 
 })();
